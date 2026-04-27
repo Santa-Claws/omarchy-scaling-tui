@@ -498,7 +498,7 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
     draw_ctrl_row(row, "Monitor Scale:", gs.monitor_scale, 1, "step 0.25  auto below 1.0")
     row += 1
     draw_ctrl_row(row, "Apply to All:", fmt(ui.apply_all), 2,
-                  "[a] sets all overrides to this value")
+                  "[a] updates scale for active overrides only (use d to add new)")
     row += 2
 
     # ── Per-app section ──────────────────────────────────────────────────────
@@ -742,11 +742,12 @@ def _adjust(gs: GlobalSettings, visible: list, ui: UIState, direction: int):
 
 
 def _apply_all(apps: list, ui: UIState):
-    for app in apps:
+    targets = [a for a in apps if a.has_override]
+    for app in targets:
         app.scale = ui.apply_all
-        app.has_override = True
-    n = len(apps)
-    ui.status_msg = f"Apply-all: {n} apps set to {fmt(ui.apply_all)} — save with [s]"
+    n = len(targets)
+    ui.status_msg = (f"Apply-all: {n} active override{'s' if n != 1 else ''} "
+                     f"set to {fmt(ui.apply_all)} — save with [s]")
     ui.status_kind = "info"
 
 
