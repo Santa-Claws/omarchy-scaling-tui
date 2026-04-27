@@ -14,6 +14,7 @@ HOME      = Path.home()
 MONITORS  = HOME / ".config/hypr/monitors.conf"
 AUTOSTART = HOME / ".config/hypr/autostart.conf"
 BINDINGS  = HOME / ".config/hypr/bindings.conf"
+USER_APPS = HOME / ".local/share/applications"
 
 
 def _app_dirs() -> list:
@@ -300,6 +301,20 @@ def save_global(gs: GlobalSettings) -> Optional[str]:
         return str(e)
 
 
+def _writable_desktop(src: Path) -> Path:
+    """Return a writable path for a .desktop file.
+
+    System files (outside HOME) are copied to ~/.local/share/applications/
+    as a user override — the XDG way to override system app entries.
+    """
+    try:
+        src.open('a').close()
+        return src          # already writable
+    except OSError:
+        USER_APPS.mkdir(parents=True, exist_ok=True)
+        return USER_APPS / src.name
+
+
 def save_app(app: AppEntry) -> Optional[str]:
     errors = []
     new_val = fmt(app.scale)
@@ -321,28 +336,29 @@ def save_app(app: AppEntry) -> Optional[str]:
                 except OSError as e:
                     errors.append(f"{path.name}: {e}")
         else:
-            # Add flag to .desktop Exec line
+            # Add flag to .desktop Exec line, copying to user dir if system file
             if not app.desktop_path:
                 errors.append(f"{app.name}: no .desktop file to write override to")
             else:
                 try:
                     content = app.desktop_path.read_text()
+                    target = _writable_desktop(app.desktop_path)
 
                     def _inject(m):
                         val = m.group(2)
-                        # Insert before any %X args
                         sub = re.search(r'(\s+%\S+.*)$', val)
                         if sub:
-                            return m.group(1) + val[:sub.start()] + \
-                                   f' --force-device-scale-factor={new_val}' + val[sub.start():]
+                            return (m.group(1) + val[:sub.start()] +
+                                    f' --force-device-scale-factor={new_val}' +
+                                    val[sub.start():])
                         return m.group(1) + val + f' --force-device-scale-factor={new_val}'
 
                     new_content = EXEC_RE.sub(_inject, content, count=1)
-                    atomic_write(app.desktop_path, new_content)
-                    # Rebuild occurrence from the written line
+                    atomic_write(target, new_content)
+                    app.desktop_path = target
                     for line in new_content.splitlines():
                         if line.startswith('Exec=') and FLAG_RE.search(line):
-                            app.occurrences = [Occurrence(app.desktop_path, line)]
+                            app.occurrences = [Occurrence(target, line)]
                             break
                 except OSError as e:
                     errors.append(f"{app.desktop_path.name}: {e}")
@@ -370,18 +386,28 @@ def save_app(app: AppEntry) -> Optional[str]:
 
 def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
     errors = []
+    saved = 0
+
     e = save_global(gs)
     if e:
         errors.append(f"monitors.conf: {e}")
+
     for app in apps:
         if app.dirty:
             e = save_app(app)
             if e:
-                errors.append(e)
+                errors.append(f"{app.name}: {e}")
+            else:
+                saved += 1
+
     n_ovr = sum(1 for a in apps if a.has_override)
-    if errors:
-        ui.status_msg = "Save FAILED: " + "; ".join(errors)
+    if errors and saved == 0 and not gs.dirty:
+        ui.status_msg = "Save FAILED: " + "  ".join(errors)
         ui.status_kind = "error"
+    elif errors:
+        ui.status_msg = (f"Saved {saved} apps — {len(errors)} failed: " +
+                         "  ".join(errors))
+        ui.status_kind = "warn"
     else:
         ui.status_msg = (f"Saved. GDK_SCALE={int(gs.gdk_scale)}  "
                          f"{n_ovr} override{'s' if n_ovr != 1 else ''}  "
