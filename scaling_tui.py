@@ -14,7 +14,18 @@ HOME      = Path.home()
 MONITORS  = HOME / ".config/hypr/monitors.conf"
 AUTOSTART = HOME / ".config/hypr/autostart.conf"
 BINDINGS  = HOME / ".config/hypr/bindings.conf"
-APPS_DIR  = HOME / ".local/share/applications"
+
+
+def _app_dirs() -> list:
+    """All directories to scan for .desktop files, user-level first."""
+    dirs = []
+    xdg_home = os.environ.get('XDG_DATA_HOME', str(HOME / '.local/share'))
+    dirs.append(Path(xdg_home) / 'applications')
+    dirs.append(HOME / '.local/share/flatpak/exports/share/applications')
+    dirs.append(Path('/var/lib/flatpak/exports/share/applications'))
+    for d in os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share').split(':'):
+        dirs.append(Path(d) / 'applications')
+    return [d for d in dirs if d.is_dir()]
 
 FLAG_RE    = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
 GDK_RE     = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
@@ -168,13 +179,19 @@ def parse_desktop(path: Path) -> Optional[dict]:
 
 
 def discover_apps() -> list:
-    apps = {}   # name.lower() -> AppEntry
+    apps = {}        # name.lower() -> AppEntry
+    seen_files: set = set()   # deduplicate by filename; user-level dirs come first
 
-    # Step 1: all visible, non-webapp .desktop files
-    try:
-        desktops = sorted(APPS_DIR.glob('*.desktop'))
-    except OSError:
-        desktops = []
+    # Step 1: all visible, non-webapp .desktop files across all XDG data dirs
+    desktops = []
+    for app_dir in _app_dirs():
+        try:
+            for p in sorted(app_dir.glob('*.desktop')):
+                if p.name not in seen_files:
+                    seen_files.add(p.name)
+                    desktops.append(p)
+        except OSError:
+            continue
 
     for desktop in desktops:
         info = parse_desktop(desktop)
