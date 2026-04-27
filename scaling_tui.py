@@ -4,29 +4,32 @@
 import curses
 import os
 import re
-import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-HOME         = Path.home()
-MONITORS     = HOME / ".config/hypr/monitors.conf"
-AUTOSTART    = HOME / ".config/hypr/autostart.conf"
-BINDINGS     = HOME / ".config/hypr/bindings.conf"
-APPS_DIR     = HOME / ".local/share/applications"
+HOME      = Path.home()
+MONITORS  = HOME / ".config/hypr/monitors.conf"
+AUTOSTART = HOME / ".config/hypr/autostart.conf"
+BINDINGS  = HOME / ".config/hypr/bindings.conf"
+APPS_DIR  = HOME / ".local/share/applications"
 
-FLAG_RE      = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
-GDK_RE       = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
-MONITOR_RE   = re.compile(r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE)
+FLAG_RE    = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
+GDK_RE     = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
+MONITOR_RE = re.compile(r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE)
+WEBAPP_RE  = re.compile(r'^omarchy-(?:launch-webapp|webapp-handler)')
+EXEC_RE    = re.compile(r'^(Exec=)(.+)$', re.MULTILINE)
 
-SCALE_STEP   = 0.05
-MON_STEP     = 0.25
-MIN_APP      = 0.1
-MAX_APP      = 3.0
-MIN_MON      = 1.0
-MAX_MON      = 4.0
+SCALE_STEP    = 0.05
+MON_STEP      = 0.25
+MIN_APP       = 0.1
+MAX_APP       = 3.0
+MIN_MON       = 1.0
+MAX_MON       = 4.0
+DEFAULT_SCALE = 0.7
+GLOBAL_ROWS   = 3   # GDK_SCALE, Monitor Scale, Apply to All
 
 
 # ── data model ───────────────────────────────────────────────────────────────
@@ -34,26 +37,30 @@ MAX_MON      = 4.0
 @dataclass
 class Occurrence:
     path: Path
-    line: str   # exact original line content (used to locate and replace)
+    line: str
 
 
 @dataclass
-class AppOverride:
+class AppEntry:
     name: str
+    desktop_path: Optional[Path]
     scale: float
+    has_override: bool
     saved_scale: float
+    saved_has_override: bool
     occurrences: list   # list[Occurrence]
-    load_error: Optional[str] = None
 
     @property
     def dirty(self):
-        return abs(self.scale - self.saved_scale) > 1e-9
+        if self.has_override != self.saved_has_override:
+            return True
+        return self.has_override and abs(self.scale - self.saved_scale) > 1e-9
 
 
 @dataclass
 class GlobalSettings:
-    gdk_scale: float           # value from env = GDK_SCALE,N  (0 = not found)
-    monitor_scale: str         # "auto" or numeric string
+    gdk_scale: float
+    monitor_scale: str
     saved_gdk: float
     saved_mon: str
     load_error: Optional[str] = None
@@ -66,7 +73,9 @@ class GlobalSettings:
 
 @dataclass
 class UIState:
-    cursor: int = 0          # 0 = GDK row, 1 = monitor row, 2+ = app overrides
+    cursor: int = 0
+    scroll: int = 0
+    apply_all: float = DEFAULT_SCALE
     status_msg: str = ""
     status_kind: str = "info"
     quit_armed: bool = False
@@ -80,34 +89,10 @@ def fmt(v: float) -> str:
     return s + '0' if s.endswith('.') else s
 
 
-def app_name_from_line(line: str) -> str:
-    m = re.search(r'flatpak run\s+[\w.-]*\.(\w+)', line)
-    if m:
-        return m.group(1)
-    m = re.search(r'omarchy-launch-or-focus\s+(\S+)', line)
-    if m:
-        return m.group(1).title()
-    m = re.search(r'uwsm-app\s+--\s+(\S+)', line)
-    if m:
-        return m.group(1).title()
-    m = re.search(r'exec\s*=\s*(\S+).*--force-device-scale-factor', line, re.IGNORECASE)
-    if m:
-        return Path(m.group(1)).stem.title()
-    return "Unknown"
-
-
-def desktop_name(path: Path) -> Optional[str]:
-    try:
-        for line in path.read_text().splitlines():
-            if line.startswith('Name='):
-                return line[5:].strip()
-    except OSError:
-        pass
-    return None
-
-
-def short(path: Path) -> str:
-    return str(path).replace(str(HOME), '~')
+def fmt_mon(v: float) -> str:
+    v = round(round(v / MON_STEP) * MON_STEP, 10)
+    s = f'{v:.10f}'.rstrip('0')
+    return s + '0' if s.endswith('.') else s
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -124,81 +109,142 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
+def app_name_from_line(line: str) -> Optional[str]:
+    m = re.search(r'flatpak run\s+[\w.-]*\.(\w+)', line)
+    if m:
+        return m.group(1)
+    m = re.search(r'omarchy-launch-or-focus\s+(\S+)', line)
+    if m:
+        return m.group(1).title()
+    m = re.search(r'uwsm-app\s+--\s+(\S+)', line)
+    if m:
+        return m.group(1).title()
+    return None
+
+
+def _put(scr, y, x, text, attr=0):
+    try:
+        scr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
 # ── discovery ────────────────────────────────────────────────────────────────
 
-def discover_overrides() -> list:
-    """Scan all config sources for --force-device-scale-factor, group by app."""
-    apps: dict = {}   # lowercase_name -> AppOverride
+def parse_desktop(path: Path) -> Optional[dict]:
+    """Parse [Desktop Entry] section; return None if hidden or webapp."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
 
-    def _ingest(path: Path, lines: list, name_fn):
-        for line in lines:
-            m = FLAG_RE.search(line)
-            if not m:
-                continue
+    in_entry = False
+    name = exec_line = None
+    no_display = False
+
+    for line in lines:
+        if line.strip() == '[Desktop Entry]':
+            in_entry = True
+            continue
+        if in_entry and line.startswith('['):
+            break
+        if not in_entry:
+            continue
+        if line.startswith('Name=') and name is None:
+            name = line[5:].strip()
+        elif line.startswith('Exec=') and exec_line is None:
+            exec_line = line
+        elif line.strip() in ('NoDisplay=true', 'Hidden=true'):
+            no_display = True
+
+    if not name or not exec_line or no_display:
+        return None
+
+    exec_val = exec_line[5:].strip()
+    if WEBAPP_RE.match(exec_val):
+        return None
+
+    return {'name': name, 'exec_line': exec_line}
+
+
+def discover_apps() -> list:
+    apps = {}   # name.lower() -> AppEntry
+
+    # Step 1: all visible, non-webapp .desktop files
+    try:
+        desktops = sorted(APPS_DIR.glob('*.desktop'))
+    except OSError:
+        desktops = []
+
+    for desktop in desktops:
+        info = parse_desktop(desktop)
+        if not info:
+            continue
+        name, exec_line = info['name'], info['exec_line']
+        key = name.lower()
+        m = FLAG_RE.search(exec_line)
+        if m:
             scale = float(m.group(2))
-            name = name_fn(line, path)
+            apps[key] = AppEntry(name=name, desktop_path=desktop,
+                                 scale=scale, has_override=True,
+                                 saved_scale=scale, saved_has_override=True,
+                                 occurrences=[Occurrence(desktop, exec_line)])
+        else:
+            apps[key] = AppEntry(name=name, desktop_path=desktop,
+                                 scale=DEFAULT_SCALE, has_override=False,
+                                 saved_scale=DEFAULT_SCALE, saved_has_override=False,
+                                 occurrences=[])
+
+    # Step 2: autostart.conf — merge occurrences
+    try:
+        for line in AUTOSTART.read_text().splitlines():
+            if not FLAG_RE.search(line):
+                continue
+            name = app_name_from_line(line)
             if not name:
                 continue
             key = name.lower()
-            if key not in apps:
-                apps[key] = AppOverride(
-                    name=name, scale=scale,
-                    saved_scale=scale, occurrences=[])
+            scale = float(FLAG_RE.search(line).group(2))
+            if key in apps:
+                apps[key].occurrences.append(Occurrence(AUTOSTART, line))
+                if not apps[key].has_override:
+                    apps[key].scale = apps[key].saved_scale = scale
+                    apps[key].has_override = apps[key].saved_has_override = True
             else:
-                # keep scale consistent with first seen; flag mismatch silently
-                pass
-            apps[key].occurrences.append(Occurrence(path=path, line=line))
-
-    # autostart.conf
-    try:
-        lines = AUTOSTART.read_text().splitlines()
-        _ingest(AUTOSTART, lines, lambda l, p: app_name_from_line(l))
+                apps[key] = AppEntry(name=name, desktop_path=None,
+                                     scale=scale, has_override=True,
+                                     saved_scale=scale, saved_has_override=True,
+                                     occurrences=[Occurrence(AUTOSTART, line)])
     except OSError:
         pass
 
-    # bindings.conf
+    # Step 3: bindings.conf — merge occurrences
     try:
-        lines = BINDINGS.read_text().splitlines()
-        _ingest(BINDINGS, lines, lambda l, p: app_name_from_line(l))
-    except OSError:
-        pass
-
-    # .desktop files
-    try:
-        for desktop in sorted(APPS_DIR.glob('*.desktop')):
-            try:
-                text = desktop.read_text()
-            except OSError:
+        for line in BINDINGS.read_text().splitlines():
+            if not FLAG_RE.search(line):
                 continue
-            for line in text.splitlines():
-                if 'Exec' not in line:
-                    continue
-                if not FLAG_RE.search(line):
-                    continue
-                m = FLAG_RE.search(line)
-                scale = float(m.group(2))
-                name = desktop_name(desktop) or desktop.stem
-                key = name.lower()
-                if key not in apps:
-                    apps[key] = AppOverride(
-                        name=name, scale=scale,
-                        saved_scale=scale, occurrences=[])
-                else:
-                    pass
-                apps[key].occurrences.append(Occurrence(path=desktop, line=line))
+            name = app_name_from_line(line)
+            if not name:
+                continue
+            key = name.lower()
+            if key in apps:
+                apps[key].occurrences.append(Occurrence(BINDINGS, line))
     except OSError:
         pass
 
-    return list(apps.values())
+    # Sort: overrides first, then alphabetically
+    entries = list(apps.values())
+    entries.sort(key=lambda a: (not a.has_override, a.name.lower()))
+    return entries
 
 
 def load_global() -> GlobalSettings:
     try:
         text = MONITORS.read_text()
     except OSError as e:
-        return GlobalSettings(0, 'auto', 0, 'auto', load_error=str(e))
+        return GlobalSettings(2.0, 'auto', 2.0, 'auto', load_error=str(e))
 
-    gdk = 0.0
+    gdk = 2.0
     m = GDK_RE.search(text)
     if m:
         gdk = float(m.group(2))
@@ -208,10 +254,7 @@ def load_global() -> GlobalSettings:
     if m:
         mon = m.group(2)
 
-    err = None
-    if gdk == 0:
-        err = "GDK_SCALE not found in monitors.conf"
-
+    err = None if GDK_RE.search(text) else "GDK_SCALE line not found in monitors.conf"
     return GlobalSettings(gdk, mon, gdk, mon, load_error=err)
 
 
@@ -223,12 +266,11 @@ def save_global(gs: GlobalSettings) -> Optional[str]:
     except OSError as e:
         return str(e)
 
-    if gs.gdk_scale > 0:
-        new_gdk = f'{gs.gdk_scale:.10f}'.rstrip('0').rstrip('.')
-        text = GDK_RE.sub(r'\g<1>' + new_gdk, text)
+    gdk_str = f'{gs.gdk_scale:.10f}'.rstrip('0').rstrip('.')
+    if GDK_RE.search(text):
+        text = GDK_RE.sub(r'\g<1>' + gdk_str, text)
 
-    new_mon = gs.monitor_scale
-    text = MONITOR_RE.sub(r'\g<1>' + new_mon, text)
+    text = MONITOR_RE.sub(r'\g<1>' + gs.monitor_scale, text)
 
     try:
         atomic_write(MONITORS, text)
@@ -239,85 +281,109 @@ def save_global(gs: GlobalSettings) -> Optional[str]:
         return str(e)
 
 
-def save_override(ov: AppOverride) -> Optional[str]:
-    new_val = fmt(ov.scale)
-    by_file: dict = defaultdict(list)
-    for occ in ov.occurrences:
-        by_file[occ.path].append(occ)
-
+def save_app(app: AppEntry) -> Optional[str]:
     errors = []
-    for path, occs in by_file.items():
-        try:
-            content = path.read_text()
-            for occ in occs:
-                new_line = FLAG_RE.sub(r'\g<1>' + new_val, occ.line)
-                content = content.replace(occ.line, new_line, 1)
-                occ.line = new_line   # update so subsequent saves work
-            atomic_write(path, content)
-        except OSError as e:
-            errors.append(f"{path.name}: {e}")
+    new_val = fmt(app.scale)
 
-    if errors:
-        return "; ".join(errors)
-    ov.saved_scale = ov.scale
-    return None
+    if app.has_override:
+        if app.saved_has_override and app.occurrences:
+            # Update existing flag in all occurrence files
+            by_file: dict = defaultdict(list)
+            for occ in app.occurrences:
+                by_file[occ.path].append(occ)
+            for path, occs in by_file.items():
+                try:
+                    content = path.read_text()
+                    for occ in occs:
+                        new_line = FLAG_RE.sub(r'\g<1>' + new_val, occ.line)
+                        content = content.replace(occ.line, new_line, 1)
+                        occ.line = new_line
+                    atomic_write(path, content)
+                except OSError as e:
+                    errors.append(f"{path.name}: {e}")
+        else:
+            # Add flag to .desktop Exec line
+            if not app.desktop_path:
+                errors.append(f"{app.name}: no .desktop file to write override to")
+            else:
+                try:
+                    content = app.desktop_path.read_text()
 
+                    def _inject(m):
+                        val = m.group(2)
+                        # Insert before any %X args
+                        sub = re.search(r'(\s+%\S+.*)$', val)
+                        if sub:
+                            return m.group(1) + val[:sub.start()] + \
+                                   f' --force-device-scale-factor={new_val}' + val[sub.start():]
+                        return m.group(1) + val + f' --force-device-scale-factor={new_val}'
 
-def remove_override(ov: AppOverride) -> Optional[str]:
-    """Strip --force-device-scale-factor from all occurrence lines."""
-    by_file: dict = defaultdict(list)
-    for occ in ov.occurrences:
-        by_file[occ.path].append(occ)
+                    new_content = EXEC_RE.sub(_inject, content, count=1)
+                    atomic_write(app.desktop_path, new_content)
+                    # Rebuild occurrence from the written line
+                    for line in new_content.splitlines():
+                        if line.startswith('Exec=') and FLAG_RE.search(line):
+                            app.occurrences = [Occurrence(app.desktop_path, line)]
+                            break
+                except OSError as e:
+                    errors.append(f"{app.desktop_path.name}: {e}")
+    else:
+        # Remove flag from all occurrence files
+        by_file = defaultdict(list)
+        for occ in app.occurrences:
+            by_file[occ.path].append(occ)
+        for path, occs in by_file.items():
+            try:
+                content = path.read_text()
+                for occ in occs:
+                    new_line = FLAG_RE.sub('', occ.line).rstrip()
+                    content = content.replace(occ.line, new_line, 1)
+                atomic_write(path, content)
+            except OSError as e:
+                errors.append(f"{path.name}: {e}")
+        app.occurrences.clear()
 
-    errors = []
-    for path, occs in by_file.items():
-        try:
-            content = path.read_text()
-            for occ in occs:
-                new_line = FLAG_RE.sub('', occ.line).rstrip()
-                content = content.replace(occ.line, new_line, 1)
-            atomic_write(path, content)
-        except OSError as e:
-            errors.append(f"{path.name}: {e}")
-
+    if not errors:
+        app.saved_scale = app.scale
+        app.saved_has_override = app.has_override
     return "; ".join(errors) if errors else None
 
 
-def save_all(gs: GlobalSettings, overrides: list, ui: UIState) -> None:
+def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
     errors = []
     e = save_global(gs)
     if e:
-        errors.append(f"global: {e}")
-    for ov in overrides:
-        if ov.dirty:
-            e = save_override(ov)
+        errors.append(f"monitors.conf: {e}")
+    for app in apps:
+        if app.dirty:
+            e = save_app(app)
             if e:
-                errors.append(f"{ov.name}: {e}")
-
+                errors.append(e)
+    n_ovr = sum(1 for a in apps if a.has_override)
     if errors:
         ui.status_msg = "Save FAILED: " + "; ".join(errors)
         ui.status_kind = "error"
     else:
-        n = len(overrides)
-        ui.status_msg = f"Saved. GDK_SCALE={int(gs.gdk_scale)}  {n} override{'s' if n != 1 else ''}"
+        ui.status_msg = (f"Saved. GDK_SCALE={int(gs.gdk_scale)}  "
+                         f"{n_ovr} override{'s' if n_ovr != 1 else ''}  "
+                         f"{len(apps)} apps")
         ui.status_kind = "ok"
 
 
 # ── drawing ──────────────────────────────────────────────────────────────────
 
-def _put(scr, y, x, text, attr=0):
-    try:
-        scr.addstr(y, x, text, attr)
-    except curses.error:
-        pass
+def _max_app_rows(h: int) -> int:
+    # title(1) blank(1) global-hdr(1) sep(1) 3-global-rows(3) blank(1)
+    # per-app-hdr(1) sep(1) help(1) status(1) = 12 overhead rows
+    return max(1, h - 12)
 
 
-def draw(scr, gs: GlobalSettings, overrides: list, ui: UIState) -> None:
+def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
     scr.erase()
     h, w = scr.getmaxyx()
 
-    if h < 12 or w < 52:
-        _put(scr, 0, 0, "Terminal too small (need 52x12)")
+    if h < 14 or w < 54:
+        _put(scr, 0, 0, "Terminal too small (need 54x14)")
         scr.refresh()
         return
 
@@ -334,116 +400,140 @@ def draw(scr, gs: GlobalSettings, overrides: list, ui: UIState) -> None:
 
     row = 2
 
-    # ── Global section ──
+    # ── Global section ──────────────────────────────────────────────────────
     _put(scr, row, 2, "Global", curses.A_BOLD)
     _put(scr, row, 9, " (monitors.conf)", C_DIM)
     row += 1
-    _put(scr, row, 2, "─" * min(w - 4, 50), C_DIM)
+    _put(scr, row, 2, "─" * min(w - 4, 56), C_DIM)
     row += 1
 
-    def draw_scale_row(y, label, value_str, idx, err=None):
+    def draw_ctrl_row(y, label, value_str, idx, hint="", err=None):
         sel = (ui.cursor == idx)
-        base = C_SEL if sel else 0
-        pad = f"  {label:<18}"
-        _put(scr, y, 2, pad, base)
+        lbl = f"  {label:<20}"
+        _put(scr, y, 2, lbl, C_SEL if sel else 0)
+        col = 2 + len(lbl)
         if err:
-            _put(scr, y, 2 + len(pad), f"[{err}]", C_ERR)
+            _put(scr, y, col, f"[{err}]", C_ERR)
         else:
-            _put(scr, y, 2 + len(pad), "[ - ]", C_CTRL if sel else C_DIM)
+            _put(scr, y, col, "[ - ]", C_CTRL if sel else C_DIM)
             val_s = f"  {value_str}  "
-            _put(scr, y, 2 + len(pad) + 5, val_s, curses.A_BOLD if sel else 0)
-            _put(scr, y, 2 + len(pad) + 5 + len(val_s), "[ + ]", C_CTRL if sel else C_DIM)
+            _put(scr, y, col + 5, val_s, curses.A_BOLD if sel else 0)
+            _put(scr, y, col + 5 + len(val_s), "[ + ]", C_CTRL if sel else C_DIM)
+            if hint:
+                _put(scr, y, col + 5 + len(val_s) + 6, hint, C_DIM)
 
     gdk_str = str(int(gs.gdk_scale)) if gs.gdk_scale > 0 else "?"
-    draw_scale_row(row, "GDK_SCALE:", gdk_str, 0,
-                   gs.load_error if gs.gdk_scale == 0 else None)
+    draw_ctrl_row(row, "GDK_SCALE:", gdk_str, 0,
+                  err=gs.load_error if gs.gdk_scale == 0 else None)
     row += 1
-    draw_scale_row(row, "Monitor Scale:", gs.monitor_scale, 1)
+    draw_ctrl_row(row, "Monitor Scale:", gs.monitor_scale, 1, "step 0.25  auto below 1.0")
+    row += 1
+    draw_ctrl_row(row, "Apply to All:", fmt(ui.apply_all), 2,
+                  "[a] sets all overrides to this value")
     row += 2
 
-    # ── Per-app section ──
+    # ── Per-app section ──────────────────────────────────────────────────────
+    n_ovr = sum(1 for a in apps if a.has_override)
     _put(scr, row, 2, "Per-App Overrides", curses.A_BOLD)
-    _put(scr, row, 20, " (override global)", C_DIM)
+    _put(scr, row, 20,
+         f" ({n_ovr} active · {len(apps)} apps · d=toggle · a=apply-all)",
+         C_DIM)
     row += 1
-    _put(scr, row, 2, "─" * min(w - 4, 50), C_DIM)
+    _put(scr, row, 2, "─" * min(w - 4, 56), C_DIM)
     row += 1
 
-    if not overrides:
-        _put(scr, row, 4, "No overrides found.", C_DIM)
-        row += 1
-    else:
-        for i, ov in enumerate(overrides):
-            idx = 2 + i
-            sel = (ui.cursor == idx)
-            base = C_SEL if sel else 0
-            dirty = " *" if ov.dirty else "  "
-            label = f"  {ov.name}{dirty}  "
-            _put(scr, row, 2, f"{label:<22}", base)
-            col = 2 + 22
+    max_vis = _max_app_rows(h)
+
+    # Keep cursor in view
+    app_idx = ui.cursor - GLOBAL_ROWS
+    if app_idx >= 0:
+        if app_idx < ui.scroll:
+            ui.scroll = app_idx
+        elif app_idx >= ui.scroll + max_vis:
+            ui.scroll = app_idx - max_vis + 1
+
+    visible = apps[ui.scroll: ui.scroll + max_vis]
+
+    for i, app in enumerate(visible):
+        abs_idx = ui.scroll + i
+        sel = (ui.cursor == GLOBAL_ROWS + abs_idx)
+        dirty = "*" if app.dirty else " "
+        name_col = f"  {dirty}{app.name:<18}"
+        _put(scr, row, 2, name_col, C_SEL if sel else 0)
+        col = 2 + len(name_col)
+
+        if app.has_override:
             _put(scr, row, col, "[ - ]", C_CTRL if sel else C_DIM)
-            val_s = f"  {fmt(ov.scale)}  "
+            val_s = f"  {fmt(app.scale)}  "
             _put(scr, row, col + 5, val_s, curses.A_BOLD if sel else 0)
-            col2 = col + 5 + len(val_s)
-            _put(scr, row, col2, "[ + ]", C_CTRL if sel else C_DIM)
-            # file hints
-            file_hints = []
-            seen = set()
-            for occ in ov.occurrences:
-                tag = occ.path.stem[:8] if occ.path.suffix == '.desktop' else occ.path.stem
+            _put(scr, row, col + 5 + len(val_s), "[ + ]",
+                 C_CTRL if sel else C_DIM)
+            # file source hints
+            seen: set = set()
+            hints = []
+            for occ in app.occurrences:
+                tag = occ.path.stem[:12]
                 if tag not in seen:
-                    file_hints.append(tag)
+                    hints.append(tag)
                     seen.add(tag)
-            _put(scr, row, col2 + 6, "  " + " • ".join(file_hints), C_DIM)
-            row += 1
+            _put(scr, row, col + 5 + len(val_s) + 6,
+                 "  " + " · ".join(hints), C_DIM)
+        else:
+            _put(scr, row, col,
+                 "(no override — inherits global)",
+                 C_DIM if not sel else C_SEL)
+        row += 1
 
-    # ── help ──
-    help_row = max(row + 1, h - 3)
-    any_dirty = gs.dirty or any(o.dirty for o in overrides)
-    help = "  [s] Save  [r] Reload  [d] Remove override  [q] Quit"
-    _put(scr, help_row, 0, help, C_DIM)
+    # scroll indicator
+    if ui.scroll > 0 or ui.scroll + max_vis < len(apps):
+        ind = f"  {ui.scroll + 1}–{min(ui.scroll + max_vis, len(apps))}/{len(apps)} ↑↓  "
+        _put(scr, row, w - len(ind) - 1, ind, C_DIM)
 
-    # ── status bar ──
-    bar = h - 1
+    # ── help bar ────────────────────────────────────────────────────────────
+    _put(scr, h - 2, 2,
+         "  [s] Save  [r] Reload  [d] Toggle override  [a] Apply-all  [q] Quit",
+         C_DIM)
+
+    # ── status bar ──────────────────────────────────────────────────────────
     s_attr = {"ok": C_OK, "error": C_ERR, "warn": C_WARN}.get(ui.status_kind, 0)
-    _put(scr, bar, 0, " " * (w - 1))
-    _put(scr, bar, 1, ui.status_msg[:w - 12], s_attr)
+    any_dirty = gs.dirty or any(a.dirty for a in apps)
+    _put(scr, h - 1, 0, " " * (w - 1))
+    _put(scr, h - 1, 1, ui.status_msg[:w - 12], s_attr)
     if any_dirty:
         tag = "[unsaved]"
-        _put(scr, bar, w - len(tag) - 1, tag, C_WARN | curses.A_BOLD)
+        _put(scr, h - 1, w - len(tag) - 1, tag, C_WARN | curses.A_BOLD)
 
     scr.refresh()
 
 
 # ── input ────────────────────────────────────────────────────────────────────
 
-def handle_key(key: int, gs: GlobalSettings, overrides: list,
-               ui: UIState) -> bool:
-    total = 2 + len(overrides)
+def handle_key(key: int, gs: GlobalSettings, apps: list, ui: UIState) -> bool:
+    total = GLOBAL_ROWS + len(apps)
     non_quit = True
 
-    if key in (curses.KEY_UP,):
+    if key == curses.KEY_UP:
         ui.cursor = (ui.cursor - 1) % total
     elif key in (curses.KEY_DOWN, ord('\t')):
         ui.cursor = (ui.cursor + 1) % total
 
     elif key in (curses.KEY_LEFT, ord('-'), ord('_')):
-        _adjust(gs, overrides, ui, -1)
-
+        _adjust(gs, apps, ui, -1)
     elif key in (curses.KEY_RIGHT, ord('+'), ord('=')):
-        _adjust(gs, overrides, ui, +1)
+        _adjust(gs, apps, ui, +1)
 
+    elif key in (ord('a'), ord('A')):
+        _apply_all(apps, ui)
     elif key in (ord('s'), ord('S')):
-        save_all(gs, overrides, ui)
-
+        save_all(gs, apps, ui)
     elif key in (ord('r'), ord('R')):
-        _reload(gs, overrides, ui)
-
+        _reload(gs, apps, ui)
     elif key in (ord('d'), ord('D')):
-        _remove(overrides, ui)
+        _toggle_override(apps, ui)
 
     elif key in (ord('q'), ord('Q'), 27):
         non_quit = False
-        any_dirty = gs.dirty or any(o.dirty for o in overrides)
+        any_dirty = gs.dirty or any(a.dirty for a in apps)
         if any_dirty and not ui.quit_armed:
             ui.status_msg = "Unsaved changes! Press [q] again to quit, [s] to save."
             ui.status_kind = "warn"
@@ -456,69 +546,84 @@ def handle_key(key: int, gs: GlobalSettings, overrides: list,
     return False
 
 
-def _adjust(gs: GlobalSettings, overrides: list, ui: UIState, direction: int):
+def _adjust(gs: GlobalSettings, apps: list, ui: UIState, direction: int):
     c = ui.cursor
-    if c == 0:                  # GDK_SCALE
+    if c == 0:
         new = max(1, min(8, int(gs.gdk_scale) + direction))
         gs.gdk_scale = float(new)
         ui.status_msg = f"GDK_SCALE → {new}"
         ui.status_kind = "info"
-    elif c == 1:                # monitor scale
+    elif c == 1:
         if gs.monitor_scale == 'auto':
             if direction > 0:
                 gs.monitor_scale = fmt_mon(MIN_MON)
         else:
             cur = float(gs.monitor_scale)
-            new = cur + direction * MON_STEP
-            if new < MIN_MON:
-                gs.monitor_scale = 'auto'
-            else:
-                gs.monitor_scale = fmt_mon(min(MAX_MON, new))
+            nv = cur + direction * MON_STEP
+            gs.monitor_scale = 'auto' if nv < MIN_MON else fmt_mon(min(MAX_MON, nv))
         ui.status_msg = f"Monitor scale → {gs.monitor_scale}"
         ui.status_kind = "info"
-    else:                       # app override
-        idx = c - 2
-        if idx < len(overrides):
-            ov = overrides[idx]
-            new = round((ov.scale + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
-            ov.scale = max(MIN_APP, min(MAX_APP, round(new, 10)))
-            ui.status_msg = f"{ov.name} → {fmt(ov.scale)}"
-            ui.status_kind = "info"
+    elif c == 2:
+        nv = round((ui.apply_all + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
+        ui.apply_all = max(MIN_APP, min(MAX_APP, round(nv, 10)))
+        ui.status_msg = f"Apply-all value → {fmt(ui.apply_all)}  (press [a] to apply)"
+        ui.status_kind = "info"
+    else:
+        idx = c - GLOBAL_ROWS
+        if idx < len(apps):
+            app = apps[idx]
+            if app.has_override:
+                nv = round((app.scale + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
+                app.scale = max(MIN_APP, min(MAX_APP, round(nv, 10)))
+                ui.status_msg = f"{app.name} → {fmt(app.scale)}"
+                ui.status_kind = "info"
+            else:
+                # First touch: activate override at apply_all value
+                app.scale = ui.apply_all
+                app.has_override = True
+                ui.status_msg = (f"{app.name}: override activated at {fmt(app.scale)} "
+                                 f"— adjust with ←→, save with [s]")
+                ui.status_kind = "info"
 
 
-def fmt_mon(v: float) -> str:
-    s = f'{v:.4f}'.rstrip('0')
-    return s + '0' if s.endswith('.') else s
+def _apply_all(apps: list, ui: UIState):
+    for app in apps:
+        app.scale = ui.apply_all
+        app.has_override = True
+    n = len(apps)
+    ui.status_msg = f"Apply-all: {n} apps set to {fmt(ui.apply_all)} — save with [s]"
+    ui.status_kind = "info"
 
 
-def _reload(gs: GlobalSettings, overrides: list, ui: UIState):
+def _reload(gs: GlobalSettings, apps: list, ui: UIState):
     new_gs = load_global()
     gs.__dict__.update(new_gs.__dict__)
-    new_ovs = discover_overrides()
-    overrides.clear()
-    overrides.extend(new_ovs)
-    n = len(overrides)
-    ui.status_msg = f"Reloaded. GDK_SCALE={int(gs.gdk_scale)}  {n} override{'s' if n != 1 else ''}"
+    new_apps = discover_apps()
+    apps.clear()
+    apps.extend(new_apps)
+    ui.scroll = 0
+    ui.cursor = min(ui.cursor, GLOBAL_ROWS + max(0, len(apps) - 1))
+    n_ovr = sum(1 for a in apps if a.has_override)
+    ui.status_msg = (f"Reloaded. GDK_SCALE={int(gs.gdk_scale)}  "
+                     f"{n_ovr} overrides  {len(apps)} apps")
     ui.status_kind = "info"
-    ui.cursor = min(ui.cursor, max(0, 1 + n))
 
 
-def _remove(overrides: list, ui: UIState):
-    idx = ui.cursor - 2
-    if idx < 0 or idx >= len(overrides):
-        ui.status_msg = "Select a per-app override to remove."
+def _toggle_override(apps: list, ui: UIState):
+    idx = ui.cursor - GLOBAL_ROWS
+    if idx < 0 or idx >= len(apps):
+        ui.status_msg = "Select an app row to toggle its override."
         ui.status_kind = "warn"
         return
-    ov = overrides[idx]
-    err = remove_override(ov)
-    if err:
-        ui.status_msg = f"Remove failed: {err}"
-        ui.status_kind = "error"
+    app = apps[idx]
+    if app.has_override:
+        app.has_override = False
+        ui.status_msg = f"{app.name}: override removed — save with [s]"
     else:
-        overrides.pop(idx)
-        ui.cursor = min(ui.cursor, 1 + len(overrides))
-        ui.status_msg = f"Removed override for {ov.name}."
-        ui.status_kind = "ok"
+        app.scale = ui.apply_all
+        app.has_override = True
+        ui.status_msg = f"{app.name}: override activated at {fmt(app.scale)} — save with [s]"
+    ui.status_kind = "info"
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -533,24 +638,26 @@ def main(scr) -> None:
     curses.init_pair(4, curses.COLOR_GREEN,  -1)
     curses.init_pair(5, curses.COLOR_RED,    -1)
 
-    gs        = load_global()
-    overrides = discover_overrides()
-    ui        = UIState()
+    gs   = load_global()
+    apps = discover_apps()
+    ui   = UIState()
 
-    n = len(overrides)
-    if gs.load_error and gs.gdk_scale == 0:
-        ui.status_msg  = f"Warning: {gs.load_error}"
-        ui.status_kind = "warn"
-    else:
-        ui.status_msg  = f"Loaded. GDK_SCALE={int(gs.gdk_scale)}  {n} override{'s' if n != 1 else ''}"
-        ui.status_kind = "info"
+    # Seed apply_all from existing overrides if they agree
+    active_scales = [a.scale for a in apps if a.has_override]
+    if active_scales and len({round(s, 2) for s in active_scales}) == 1:
+        ui.apply_all = active_scales[0]
+
+    n_ovr = sum(1 for a in apps if a.has_override)
+    ui.status_msg  = (f"Loaded. GDK_SCALE={int(gs.gdk_scale)}  "
+                      f"{n_ovr} overrides  {len(apps)} apps")
+    ui.status_kind = "info"
 
     while True:
-        draw(scr, gs, overrides, ui)
+        draw(scr, gs, apps, ui)
         key = scr.getch()
         if key == curses.KEY_RESIZE:
             continue
-        if handle_key(key, gs, overrides, ui):
+        if handle_key(key, gs, apps, ui):
             break
 
 
