@@ -87,6 +87,8 @@ class UIState:
     cursor: int = 0
     scroll: int = 0
     apply_all: float = DEFAULT_SCALE
+    search_mode: bool = False
+    search_query: str = ""
     status_msg: str = ""
     status_kind: str = "info"
     quit_armed: bool = False
@@ -389,6 +391,30 @@ def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
 
 # ── drawing ──────────────────────────────────────────────────────────────────
 
+def _filter_apps(apps: list, query: str) -> list:
+    if not query:
+        return apps
+    q = query.lower()
+    return [a for a in apps if q in a.name.lower()]
+
+
+def _put_name_highlighted(scr, row, col, name: str, query: str, base_attr, hi_attr):
+    """Write app name, highlighting the matched substring."""
+    if not query:
+        _put(scr, row, col, name, base_attr)
+        return
+    idx = name.lower().find(query.lower())
+    if idx < 0:
+        _put(scr, row, col, name, base_attr)
+        return
+    end = idx + len(query)
+    if idx > 0:
+        _put(scr, row, col, name[:idx], base_attr)
+    _put(scr, row, col + idx, name[idx:end], hi_attr)
+    if end < len(name):
+        _put(scr, row, col + end, name[end:], base_attr)
+
+
 def _max_app_rows(h: int) -> int:
     # title(1) blank(1) global-hdr(1) sep(1) 3-global-rows(3) blank(1)
     # per-app-hdr(1) sep(1) help(1) status(1) = 12 overhead rows
@@ -451,33 +477,52 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
 
     # ── Per-app section ──────────────────────────────────────────────────────
     n_ovr = sum(1 for a in apps if a.has_override)
+    filtered = _filter_apps(apps, ui.search_query)
+    n_match = len(filtered)
+
     _put(scr, row, 2, "Per-App Overrides", curses.A_BOLD)
-    _put(scr, row, 20,
-         f" ({n_ovr} active · {len(apps)} apps · d=toggle · a=apply-all)",
-         C_DIM)
+    if ui.search_query:
+        _put(scr, row, 20,
+             f" ({n_match} of {len(apps)} match · {n_ovr} active · d=toggle)",
+             C_DIM)
+    else:
+        _put(scr, row, 20,
+             f" ({n_ovr} active · {len(apps)} apps · d=toggle · a=apply-all)",
+             C_DIM)
     row += 1
     _put(scr, row, 2, "─" * min(w - 4, 56), C_DIM)
     row += 1
 
     max_vis = _max_app_rows(h)
 
-    # Keep cursor in view
+    # Keep cursor in view relative to filtered list
     app_idx = ui.cursor - GLOBAL_ROWS
     if app_idx >= 0:
         if app_idx < ui.scroll:
             ui.scroll = app_idx
         elif app_idx >= ui.scroll + max_vis:
             ui.scroll = app_idx - max_vis + 1
+    if ui.scroll > max(0, n_match - max_vis):
+        ui.scroll = max(0, n_match - max_vis)
 
-    visible = apps[ui.scroll: ui.scroll + max_vis]
+    page = filtered[ui.scroll: ui.scroll + max_vis]
 
-    for i, app in enumerate(visible):
+    for i, app in enumerate(page):
         abs_idx = ui.scroll + i
         sel = (ui.cursor == GLOBAL_ROWS + abs_idx)
         dirty = "*" if app.dirty else " "
-        name_col = f"  {dirty}{app.name:<18}"
-        _put(scr, row, 2, name_col, C_SEL if sel else 0)
-        col = 2 + len(name_col)
+
+        # name with search highlight
+        prefix = f"  {dirty}"
+        _put(scr, row, 2, prefix, C_SEL if sel else 0)
+        name_w = 18
+        name_disp = app.name[:name_w].ljust(name_w)
+        hi_attr = (curses.color_pair(3) | curses.A_BOLD |
+                   (curses.A_REVERSE if sel else 0))
+        _put_name_highlighted(scr, row, 2 + len(prefix), name_disp,
+                              ui.search_query,
+                              C_SEL if sel else 0, hi_attr)
+        col = 2 + len(prefix) + name_w + 1
 
         if app.has_override:
             _put(scr, row, col, "[ - ]", C_CTRL if sel else C_DIM)
@@ -485,7 +530,6 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
             _put(scr, row, col + 5, val_s, curses.A_BOLD if sel else 0)
             _put(scr, row, col + 5 + len(val_s), "[ + ]",
                  C_CTRL if sel else C_DIM)
-            # file source hints
             seen: set = set()
             hints = []
             for occ in app.occurrences:
@@ -502,14 +546,25 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
         row += 1
 
     # scroll indicator
-    if ui.scroll > 0 or ui.scroll + max_vis < len(apps):
-        ind = f"  {ui.scroll + 1}–{min(ui.scroll + max_vis, len(apps))}/{len(apps)} ↑↓  "
+    if ui.scroll > 0 or ui.scroll + max_vis < n_match:
+        ind = f"  {ui.scroll + 1}–{min(ui.scroll + max_vis, n_match)}/{n_match} ↑↓  "
         _put(scr, row, w - len(ind) - 1, ind, C_DIM)
 
-    # ── help bar ────────────────────────────────────────────────────────────
-    _put(scr, h - 2, 2,
-         "  [s] Save  [r] Reload  [d] Toggle override  [a] Apply-all  [q] Quit",
-         C_DIM)
+    # ── help bar / search bar ────────────────────────────────────────────────
+    if ui.search_mode or ui.search_query:
+        # Search bar replaces help bar
+        prompt = "/"
+        query_disp = ui.search_query
+        cursor_char = "█" if ui.search_mode else " "
+        match_info = (f"  {n_match}/{len(apps)} match{'es' if n_match != 1 else ''}"
+                      f"  [Esc] clear  [Enter] done")
+        bar = f"  {prompt}{query_disp}{cursor_char}{match_info}"
+        _put(scr, h - 2, 0, " " * (w - 1), C_CTRL)
+        _put(scr, h - 2, 0, bar[:w - 1], C_CTRL)
+    else:
+        _put(scr, h - 2, 2,
+             "  [/] Search  [s] Save  [r] Reload  [d] Toggle  [a] Apply-all  [q] Quit",
+             C_DIM)
 
     # ── status bar ──────────────────────────────────────────────────────────
     s_attr = {"ok": C_OK, "error": C_ERR, "warn": C_WARN}.get(ui.status_kind, 0)
@@ -526,18 +581,51 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
 # ── input ────────────────────────────────────────────────────────────────────
 
 def handle_key(key: int, gs: GlobalSettings, apps: list, ui: UIState) -> bool:
-    total = GLOBAL_ROWS + len(apps)
+    visible = _filter_apps(apps, ui.search_query)
+    total = GLOBAL_ROWS + len(visible)
     non_quit = True
 
+    # ── search mode: intercept printable chars and backspace ─────────────────
+    if ui.search_mode:
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            ui.search_query = ui.search_query[:-1]
+            ui.scroll = 0
+            ui.cursor = GLOBAL_ROWS
+            return False
+        elif key in (ord('\n'), ord('\r'), curses.KEY_ENTER):
+            ui.search_mode = False
+            return False
+        elif key == 27:   # Escape — clear and exit search
+            ui.search_mode = False
+            ui.search_query = ""
+            ui.scroll = 0
+            ui.cursor = GLOBAL_ROWS
+            return False
+        elif 32 <= key <= 126 and chr(key) not in ('/'):
+            ui.search_query += chr(key)
+            ui.scroll = 0
+            ui.cursor = GLOBAL_ROWS
+            return False
+        # fall through for arrow keys / action keys even in search mode
+
+    # ── navigation ───────────────────────────────────────────────────────────
     if key == curses.KEY_UP:
         ui.cursor = (ui.cursor - 1) % total
     elif key in (curses.KEY_DOWN, ord('\t')):
         ui.cursor = (ui.cursor + 1) % total
 
+    # ── scale adjustment ─────────────────────────────────────────────────────
     elif key in (curses.KEY_LEFT, ord('-'), ord('_')):
-        _adjust(gs, apps, ui, -1)
+        _adjust(gs, visible, ui, -1)
     elif key in (curses.KEY_RIGHT, ord('+'), ord('=')):
-        _adjust(gs, apps, ui, +1)
+        _adjust(gs, visible, ui, +1)
+
+    # ── actions ──────────────────────────────────────────────────────────────
+    elif key == ord('/'):
+        ui.search_mode = True
+        ui.search_query = ""
+        ui.scroll = 0
+        ui.cursor = GLOBAL_ROWS
 
     elif key in (ord('a'), ord('A')):
         _apply_all(apps, ui)
@@ -545,25 +633,50 @@ def handle_key(key: int, gs: GlobalSettings, apps: list, ui: UIState) -> bool:
         save_all(gs, apps, ui)
     elif key in (ord('r'), ord('R')):
         _reload(gs, apps, ui)
+        ui.search_query = ""
+        ui.search_mode = False
     elif key in (ord('d'), ord('D')):
-        _toggle_override(apps, ui)
+        _toggle_override(visible, ui)
 
-    elif key in (ord('q'), ord('Q'), 27):
-        non_quit = False
-        any_dirty = gs.dirty or any(a.dirty for a in apps)
-        if any_dirty and not ui.quit_armed:
-            ui.status_msg = "Unsaved changes! Press [q] again to quit, [s] to save."
-            ui.status_kind = "warn"
-            ui.quit_armed = True
-            return False
-        return True
+    elif key in (ord('q'), ord('Q')):
+        if ui.search_mode or ui.search_query:
+            # q exits search first
+            ui.search_mode = False
+            ui.search_query = ""
+            ui.scroll = 0
+            ui.cursor = GLOBAL_ROWS
+        else:
+            non_quit = False
+            any_dirty = gs.dirty or any(a.dirty for a in apps)
+            if any_dirty and not ui.quit_armed:
+                ui.status_msg = "Unsaved changes! Press [q] again to quit, [s] to save."
+                ui.status_kind = "warn"
+                ui.quit_armed = True
+                return False
+            return True
+
+    elif key == 27:  # Escape outside search mode
+        if ui.search_query:
+            ui.search_mode = False
+            ui.search_query = ""
+            ui.scroll = 0
+            ui.cursor = GLOBAL_ROWS
+        else:
+            non_quit = False
+            any_dirty = gs.dirty or any(a.dirty for a in apps)
+            if any_dirty and not ui.quit_armed:
+                ui.status_msg = "Unsaved changes! Press [q] again to quit, [s] to save."
+                ui.status_kind = "warn"
+                ui.quit_armed = True
+                return False
+            return True
 
     if non_quit:
         ui.quit_armed = False
     return False
 
 
-def _adjust(gs: GlobalSettings, apps: list, ui: UIState, direction: int):
+def _adjust(gs: GlobalSettings, visible: list, ui: UIState, direction: int):
     c = ui.cursor
     if c == 0:
         new = max(1, min(8, int(gs.gdk_scale) + direction))
@@ -587,15 +700,14 @@ def _adjust(gs: GlobalSettings, apps: list, ui: UIState, direction: int):
         ui.status_kind = "info"
     else:
         idx = c - GLOBAL_ROWS
-        if idx < len(apps):
-            app = apps[idx]
+        if idx < len(visible):
+            app = visible[idx]
             if app.has_override:
                 nv = round((app.scale + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
                 app.scale = max(MIN_APP, min(MAX_APP, round(nv, 10)))
                 ui.status_msg = f"{app.name} → {fmt(app.scale)}"
                 ui.status_kind = "info"
             else:
-                # First touch: activate override at apply_all value
                 app.scale = ui.apply_all
                 app.has_override = True
                 ui.status_msg = (f"{app.name}: override activated at {fmt(app.scale)} "
@@ -626,13 +738,13 @@ def _reload(gs: GlobalSettings, apps: list, ui: UIState):
     ui.status_kind = "info"
 
 
-def _toggle_override(apps: list, ui: UIState):
+def _toggle_override(visible: list, ui: UIState):
     idx = ui.cursor - GLOBAL_ROWS
-    if idx < 0 or idx >= len(apps):
+    if idx < 0 or idx >= len(visible):
         ui.status_msg = "Select an app row to toggle its override."
         ui.status_kind = "warn"
         return
-    app = apps[idx]
+    app = visible[idx]
     if app.has_override:
         app.has_override = False
         ui.status_msg = f"{app.name}: override removed — save with [s]"
