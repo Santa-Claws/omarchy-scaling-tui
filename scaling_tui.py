@@ -315,6 +315,37 @@ def _writable_desktop(src: Path) -> Path:
         return USER_APPS / src.name
 
 
+def _inject_desktop(app: AppEntry, new_val: str, errors: list) -> None:
+    """Inject --force-device-scale-factor into app's .desktop Exec line."""
+    if not app.desktop_path:
+        return
+    try:
+        content = app.desktop_path.read_text()
+        target = _writable_desktop(app.desktop_path)
+
+        def _do_inject(m):
+            val = m.group(2)
+            # Insert before flatpak @@-forwarding markers first, then %X placeholders
+            sub = re.search(r'\s+@@', val) or re.search(r'\s+%\S+', val)
+            if sub:
+                return (m.group(1) + val[:sub.start()] +
+                        f' --force-device-scale-factor={new_val}' +
+                        val[sub.start():])
+            return m.group(1) + val + f' --force-device-scale-factor={new_val}'
+
+        new_content = EXEC_RE.sub(_do_inject, content, count=1)
+        atomic_write(target, new_content)
+        app.desktop_path = target
+        # Replace any stale .desktop occurrence; append fresh one
+        app.occurrences = [o for o in app.occurrences if o.path != target]
+        for line in new_content.splitlines():
+            if line.startswith('Exec=') and FLAG_RE.search(line):
+                app.occurrences.append(Occurrence(target, line))
+                break
+    except OSError as e:
+        errors.append(f"{app.desktop_path.name}: {e}")
+
+
 def save_app(app: AppEntry) -> Optional[str]:
     errors = []
     new_val = fmt(app.scale)
@@ -335,33 +366,16 @@ def save_app(app: AppEntry) -> Optional[str]:
                     atomic_write(path, content)
                 except OSError as e:
                     errors.append(f"{path.name}: {e}")
+            # Sync .desktop if it exists but has no occurrence (e.g. flag only in autostart)
+            occ_paths = {o.path for o in app.occurrences}
+            if app.desktop_path and app.desktop_path not in occ_paths:
+                _inject_desktop(app, new_val, errors)
         else:
-            # Add flag to .desktop Exec line, copying to user dir if system file
-            if not app.desktop_path:
-                errors.append(f"{app.name}: no .desktop file to write override to")
+            # Add flag to .desktop Exec line, copying to user dir if needed
+            if app.desktop_path:
+                _inject_desktop(app, new_val, errors)
             else:
-                try:
-                    content = app.desktop_path.read_text()
-                    target = _writable_desktop(app.desktop_path)
-
-                    def _inject(m):
-                        val = m.group(2)
-                        sub = re.search(r'(\s+%\S+.*)$', val)
-                        if sub:
-                            return (m.group(1) + val[:sub.start()] +
-                                    f' --force-device-scale-factor={new_val}' +
-                                    val[sub.start():])
-                        return m.group(1) + val + f' --force-device-scale-factor={new_val}'
-
-                    new_content = EXEC_RE.sub(_inject, content, count=1)
-                    atomic_write(target, new_content)
-                    app.desktop_path = target
-                    for line in new_content.splitlines():
-                        if line.startswith('Exec=') and FLAG_RE.search(line):
-                            app.occurrences = [Occurrence(target, line)]
-                            break
-                except OSError as e:
-                    errors.append(f"{app.desktop_path.name}: {e}")
+                errors.append(f"{app.name}: no .desktop file to write override to")
     else:
         # Remove flag from all occurrence files
         by_file = defaultdict(list)
