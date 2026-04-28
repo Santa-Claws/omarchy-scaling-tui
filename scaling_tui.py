@@ -63,8 +63,17 @@ class AppEntry:
     occurrences: list   # list[Occurrence]
 
     @property
+    def desktop_unsynced(self) -> bool:
+        """True when override is active but .desktop isn't one of the occurrence files."""
+        if not self.has_override or not self.desktop_path:
+            return False
+        return not any(o.path == self.desktop_path for o in self.occurrences)
+
+    @property
     def dirty(self):
         if self.has_override != self.saved_has_override:
+            return True
+        if self.desktop_unsynced:
             return True
         return self.has_override and abs(self.scale - self.saved_scale) > 1e-9
 
