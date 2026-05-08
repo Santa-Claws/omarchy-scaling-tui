@@ -4,6 +4,7 @@
 import curses
 import os
 import re
+import subprocess
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -28,11 +29,63 @@ def _app_dirs() -> list:
         dirs.append(Path(d) / 'applications')
     return [d for d in dirs if d.is_dir()]
 
-FLAG_RE    = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
-GDK_RE     = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
-MONITOR_RE = re.compile(r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE)
-WEBAPP_RE  = re.compile(r'^omarchy-(?:launch-webapp|webapp-handler)')
-EXEC_RE    = re.compile(r'^(Exec=)(.+)$', re.MULTILINE)
+
+def _flatpak_runtimes() -> dict:
+    """One call: {app_id: runtime_string} for all installed flatpak apps."""
+    try:
+        r = subprocess.run(
+            ['flatpak', 'list', '--columns=application,runtime'],
+            capture_output=True, text=True, timeout=10
+        )
+        result = {}
+        for line in r.stdout.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                result[parts[0].strip()] = parts[1].strip()
+        return result
+    except Exception:
+        return {}
+
+
+def _scale_via_from_runtime(runtime: str) -> str:
+    r = runtime.lower()
+    if 'freedesktop' in r:
+        return 'flag'     # Electron / Chromium
+    if 'kde' in r:
+        return 'qt'       # Qt native
+    return 'gdk_dpi'      # GTK / wxWidgets / other GNOME-stack
+
+
+def _read_flatpak_env(app_id: str, env_var: str) -> Optional[str]:
+    """Read a single env var set via flatpak override --user for app_id."""
+    try:
+        r = subprocess.run(
+            ['flatpak', 'override', '--user', '--show', app_id],
+            capture_output=True, text=True, timeout=5
+        )
+        in_env = False
+        for line in r.stdout.splitlines():
+            if line.strip() == '[Environment]':
+                in_env = True
+                continue
+            if in_env and line.startswith('['):
+                break
+            if in_env and line.startswith(env_var + '='):
+                return line[len(env_var) + 1:]
+    except Exception:
+        pass
+    return None
+
+
+FLAG_RE       = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
+GDK_RE        = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
+MONITOR_RE    = re.compile(r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE)
+WEBAPP_RE     = re.compile(r'^omarchy-(?:launch-webapp|webapp-handler)')
+EXEC_RE       = re.compile(r'^(Exec=)(.+)$', re.MULTILINE)
+FLATPAK_ID_RE = re.compile(r'flatpak\s+run\s+(?:--\S+\s+)*([\w-]+(?:\.[\w-]+)+)')
+
+# env var used to scale each kind of non-Electron native app
+_SCALE_ENV = {'gdk_dpi': 'GDK_DPI_SCALE', 'qt': 'QT_SCALE_FACTOR'}
 
 SCALE_STEP    = 0.05
 MON_STEP      = 0.25
@@ -60,11 +113,15 @@ class AppEntry:
     has_override: bool
     saved_scale: float
     saved_has_override: bool
-    occurrences: list   # list[Occurrence]
+    occurrences: list        # list[Occurrence]
+    flatpak_id: Optional[str] = None
+    scale_via: str = 'flag'  # 'flag' | 'gdk_dpi' | 'qt'
 
     @property
     def desktop_unsynced(self) -> bool:
-        """True when override is active but .desktop isn't one of the occurrence files."""
+        """True when Electron override is active but .desktop isn't in occurrences."""
+        if self.scale_via != 'flag':
+            return False
         if not self.has_override or not self.desktop_path:
             return False
         return not any(o.path == self.desktop_path for o in self.occurrences)
@@ -162,7 +219,7 @@ def parse_desktop(path: Path) -> Optional[dict]:
         return None
 
     in_entry = False
-    name = exec_line = None
+    name = exec_line = flatpak_id = None
     no_display = False
 
     for line in lines:
@@ -177,6 +234,8 @@ def parse_desktop(path: Path) -> Optional[dict]:
             name = line[5:].strip()
         elif line.startswith('Exec=') and exec_line is None:
             exec_line = line
+        elif line.startswith('X-Flatpak=') and flatpak_id is None:
+            flatpak_id = line[10:].strip()
         elif line.strip() in ('NoDisplay=true', 'Hidden=true'):
             no_display = True
 
@@ -187,12 +246,20 @@ def parse_desktop(path: Path) -> Optional[dict]:
     if WEBAPP_RE.match(exec_val):
         return None
 
-    return {'name': name, 'exec_line': exec_line}
+    # Fall back to parsing the Exec line if X-Flatpak wasn't present
+    if not flatpak_id:
+        m = FLATPAK_ID_RE.search(exec_val)
+        if m:
+            flatpak_id = m.group(1)
+
+    return {'name': name, 'exec_line': exec_line, 'flatpak_id': flatpak_id}
 
 
 def discover_apps() -> list:
     apps = {}        # name.lower() -> AppEntry
     seen_files: set = set()   # deduplicate by filename; user-level dirs come first
+
+    runtimes = _flatpak_runtimes()
 
     # Step 1: all visible, non-webapp .desktop files across all XDG data dirs
     desktops = []
@@ -210,21 +277,52 @@ def discover_apps() -> list:
         if not info:
             continue
         name, exec_line = info['name'], info['exec_line']
+        flatpak_id = info.get('flatpak_id')
         key = name.lower()
+
+        # Determine scaling method from flatpak runtime
+        scale_via = 'flag'
+        if flatpak_id and flatpak_id in runtimes:
+            scale_via = _scale_via_from_runtime(runtimes[flatpak_id])
+
+        if scale_via != 'flag':
+            # Non-Electron: read current GDK_DPI_SCALE / QT_SCALE_FACTOR override
+            env_var = _SCALE_ENV[scale_via]
+            val = _read_flatpak_env(flatpak_id, env_var) if flatpak_id else None
+            if val:
+                try:
+                    scale = float(val)
+                    apps[key] = AppEntry(name=name, desktop_path=desktop,
+                                         scale=scale, has_override=True,
+                                         saved_scale=scale, saved_has_override=True,
+                                         occurrences=[],
+                                         flatpak_id=flatpak_id, scale_via=scale_via)
+                    continue
+                except ValueError:
+                    pass
+            apps[key] = AppEntry(name=name, desktop_path=desktop,
+                                 scale=DEFAULT_SCALE, has_override=False,
+                                 saved_scale=DEFAULT_SCALE, saved_has_override=False,
+                                 occurrences=[],
+                                 flatpak_id=flatpak_id, scale_via=scale_via)
+            continue
+
         m = FLAG_RE.search(exec_line)
         if m:
             scale = float(m.group(2))
             apps[key] = AppEntry(name=name, desktop_path=desktop,
                                  scale=scale, has_override=True,
                                  saved_scale=scale, saved_has_override=True,
-                                 occurrences=[Occurrence(desktop, exec_line)])
+                                 occurrences=[Occurrence(desktop, exec_line)],
+                                 flatpak_id=flatpak_id, scale_via='flag')
         else:
             apps[key] = AppEntry(name=name, desktop_path=desktop,
                                  scale=DEFAULT_SCALE, has_override=False,
                                  saved_scale=DEFAULT_SCALE, saved_has_override=False,
-                                 occurrences=[])
+                                 occurrences=[],
+                                 flatpak_id=flatpak_id, scale_via='flag')
 
-    # Step 2: autostart.conf — merge occurrences
+    # Step 2: autostart.conf — merge occurrences (flag-based apps only)
     try:
         for line in AUTOSTART.read_text().splitlines():
             if not FLAG_RE.search(line):
@@ -235,6 +333,8 @@ def discover_apps() -> list:
             key = name.lower()
             scale = float(FLAG_RE.search(line).group(2))
             if key in apps:
+                if apps[key].scale_via != 'flag':
+                    continue  # don't inject Chromium flag into native apps
                 apps[key].occurrences.append(Occurrence(AUTOSTART, line))
                 if not apps[key].has_override:
                     apps[key].scale = apps[key].saved_scale = scale
@@ -247,7 +347,7 @@ def discover_apps() -> list:
     except OSError:
         pass
 
-    # Step 3: bindings.conf — merge occurrences
+    # Step 3: bindings.conf — merge occurrences (flag-based apps only)
     try:
         for line in BINDINGS.read_text().splitlines():
             if not FLAG_RE.search(line):
@@ -256,7 +356,7 @@ def discover_apps() -> list:
             if not name:
                 continue
             key = name.lower()
-            if key in apps:
+            if key in apps and apps[key].scale_via == 'flag':
                 apps[key].occurrences.append(Occurrence(BINDINGS, line))
     except OSError:
         pass
@@ -288,6 +388,31 @@ def load_global() -> GlobalSettings:
 
 
 # ── save ─────────────────────────────────────────────────────────────────────
+
+def _save_flatpak_env(app: AppEntry) -> Optional[str]:
+    """Set or unset GDK_DPI_SCALE / QT_SCALE_FACTOR via flatpak override."""
+    env_var = _SCALE_ENV.get(app.scale_via)
+    if not env_var or not app.flatpak_id:
+        return f"{app.name}: no flatpak env var for scale_via={app.scale_via!r}"
+    try:
+        if app.has_override:
+            cmd = ['flatpak', 'override', '--user',
+                   f'--env={env_var}={fmt(app.scale)}', app.flatpak_id]
+        else:
+            cmd = ['flatpak', 'override', '--user',
+                   f'--unset-env={env_var}', app.flatpak_id]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = r.stderr.strip() or f"exit {r.returncode}"
+            return f"{app.name}: flatpak override failed — {msg}"
+        app.saved_scale = app.scale
+        app.saved_has_override = app.has_override
+        return None
+    except FileNotFoundError:
+        return f"{app.name}: flatpak not found"
+    except Exception as e:
+        return str(e)
+
 
 def save_global(gs: GlobalSettings) -> Optional[str]:
     try:
@@ -356,6 +481,9 @@ def _inject_desktop(app: AppEntry, new_val: str, errors: list) -> None:
 
 
 def save_app(app: AppEntry) -> Optional[str]:
+    if app.scale_via in _SCALE_ENV:
+        return _save_flatpak_env(app)
+
     errors = []
     new_val = fmt(app.scale)
 
@@ -579,15 +707,20 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
             _put(scr, row, col + 5, val_s, curses.A_BOLD if sel else 0)
             _put(scr, row, col + 5 + len(val_s), "[ + ]",
                  C_CTRL if sel else C_DIM)
-            seen: set = set()
-            hints = []
-            for occ in app.occurrences:
-                tag = occ.path.stem[:12]
-                if tag not in seen:
-                    hints.append(tag)
-                    seen.add(tag)
-            _put(scr, row, col + 5 + len(val_s) + 6,
-                 "  " + " · ".join(hints), C_DIM)
+            if app.scale_via != 'flag':
+                env_label = _SCALE_ENV.get(app.scale_via, app.scale_via)
+                _put(scr, row, col + 5 + len(val_s) + 6,
+                     f"  {env_label}", C_DIM)
+            else:
+                seen: set = set()
+                hints = []
+                for occ in app.occurrences:
+                    tag = occ.path.stem[:12]
+                    if tag not in seen:
+                        hints.append(tag)
+                        seen.add(tag)
+                _put(scr, row, col + 5 + len(val_s) + 6,
+                     "  " + " · ".join(hints), C_DIM)
         else:
             _put(scr, row, col,
                  "(no override — inherits global)",
