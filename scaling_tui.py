@@ -101,7 +101,7 @@ EXEC_RE       = re.compile(r'^(Exec=)(.+)$', re.MULTILINE)
 FLATPAK_ID_RE = re.compile(r'flatpak\s+run\s+(?:--\S+\s+)*([\w-]+(?:\.[\w-]+)+)')
 
 # env var used to scale each kind of non-Electron native app
-_SCALE_ENV = {'gdk_dpi': 'GDK_DPI_SCALE', 'qt': 'QT_SCALE_FACTOR'}
+_SCALE_ENV = {'gdk_dpi': 'GDK_DPI_SCALE', 'gdk_scale': 'GDK_SCALE', 'qt': 'QT_SCALE_FACTOR'}
 
 SCALE_STEP    = 0.05
 MON_STEP      = 0.25
@@ -132,8 +132,9 @@ class AppEntry:
     saved_has_override: bool
     occurrences: list        # list[Occurrence]
     flatpak_id: Optional[str] = None
-    scale_via: str = 'flag'       # 'flag' | 'gdk_dpi' | 'qt' | 'app'
+    scale_via: str = 'flag'       # 'flag' | 'gdk_dpi' | 'gdk_scale' | 'qt' | 'app'
     saved_scale_via: str = 'flag' # tracks persisted state for dirty detection
+    wm_class: Optional[str] = None  # StartupWMClass from .desktop, for window matching
 
     @property
     def desktop_unsynced(self) -> bool:
@@ -239,7 +240,7 @@ def parse_desktop(path: Path) -> Optional[dict]:
         return None
 
     in_entry = False
-    name = exec_line = flatpak_id = None
+    name = exec_line = flatpak_id = wm_class = None
     no_display = False
 
     for line in lines:
@@ -256,6 +257,8 @@ def parse_desktop(path: Path) -> Optional[dict]:
             exec_line = line
         elif line.startswith('X-Flatpak=') and flatpak_id is None:
             flatpak_id = line[10:].strip()
+        elif line.startswith('StartupWMClass=') and wm_class is None:
+            wm_class = line[15:].strip()
         elif line.strip() in ('NoDisplay=true', 'Hidden=true'):
             no_display = True
 
@@ -272,7 +275,8 @@ def parse_desktop(path: Path) -> Optional[dict]:
         if m:
             flatpak_id = m.group(1)
 
-    return {'name': name, 'exec_line': exec_line, 'flatpak_id': flatpak_id}
+    return {'name': name, 'exec_line': exec_line, 'flatpak_id': flatpak_id,
+            'wm_class': wm_class}
 
 
 def discover_apps() -> list:
@@ -298,6 +302,7 @@ def discover_apps() -> list:
             continue
         name, exec_line = info['name'], info['exec_line']
         flatpak_id = info.get('flatpak_id')
+        wm_class   = info.get('wm_class')
         key = name.lower()
 
         # Determine scaling method from flatpak runtime
@@ -306,9 +311,18 @@ def discover_apps() -> list:
             scale_via = _scale_via_from_runtime(runtimes[flatpak_id])
 
         if scale_via != 'flag':
-            # Non-Electron: read current GDK_DPI_SCALE / QT_SCALE_FACTOR override
-            env_var = _SCALE_ENV[scale_via]
-            val = _read_flatpak_env(flatpak_id, env_var) if flatpak_id else None
+            # Non-Electron: detect which env var override is currently active.
+            # For GNOME-stack apps check GDK_SCALE (integer) first, then GDK_DPI_SCALE.
+            detected_via = scale_via
+            val = None
+            if flatpak_id:
+                if scale_via == 'gdk_dpi':
+                    gdk_val = _read_flatpak_env(flatpak_id, 'GDK_SCALE')
+                    if gdk_val:
+                        val = gdk_val
+                        detected_via = 'gdk_scale'
+                if val is None:
+                    val = _read_flatpak_env(flatpak_id, _SCALE_ENV[scale_via])
             if val:
                 try:
                     scale = float(val)
@@ -317,7 +331,9 @@ def discover_apps() -> list:
                                          saved_scale=scale, saved_has_override=True,
                                          occurrences=[],
                                          flatpak_id=flatpak_id,
-                                         scale_via=scale_via, saved_scale_via=scale_via)
+                                         scale_via=detected_via,
+                                         saved_scale_via=detected_via,
+                                         wm_class=wm_class)
                     continue
                 except ValueError:
                     pass
@@ -326,7 +342,8 @@ def discover_apps() -> list:
                                  saved_scale=DEFAULT_SCALE, saved_has_override=False,
                                  occurrences=[],
                                  flatpak_id=flatpak_id,
-                                 scale_via=scale_via, saved_scale_via=scale_via)
+                                 scale_via=scale_via, saved_scale_via=scale_via,
+                                 wm_class=wm_class)
             continue
 
         m = FLAG_RE.search(exec_line)
@@ -337,14 +354,16 @@ def discover_apps() -> list:
                                  saved_scale=scale, saved_has_override=True,
                                  occurrences=[Occurrence(desktop, exec_line)],
                                  flatpak_id=flatpak_id,
-                                 scale_via='flag', saved_scale_via='flag')
+                                 scale_via='flag', saved_scale_via='flag',
+                                 wm_class=wm_class)
         else:
             apps[key] = AppEntry(name=name, desktop_path=desktop,
                                  scale=DEFAULT_SCALE, has_override=False,
                                  saved_scale=DEFAULT_SCALE, saved_has_override=False,
                                  occurrences=[],
                                  flatpak_id=flatpak_id,
-                                 scale_via='flag', saved_scale_via='flag')
+                                 scale_via='flag', saved_scale_via='flag',
+                                 wm_class=wm_class)
 
     # Step 2: autostart.conf — merge occurrences (flag-based apps only)
     try:
@@ -425,7 +444,7 @@ def load_global() -> GlobalSettings:
 # ── save ─────────────────────────────────────────────────────────────────────
 
 def _save_flatpak_env(app: AppEntry) -> Optional[str]:
-    """Set/unset GDK_DPI_SCALE or QT_SCALE_FACTOR via flatpak override."""
+    """Set/unset GDK_DPI_SCALE, GDK_SCALE, or QT_SCALE_FACTOR via flatpak override."""
     if not app.flatpak_id:
         return f"{app.name}: no flatpak app ID"
 
@@ -447,10 +466,22 @@ def _save_flatpak_env(app: AppEntry) -> Optional[str]:
     env_var = _SCALE_ENV.get(app.scale_via)
     if not env_var:
         return f"{app.name}: unknown scale_via={app.scale_via!r}"
+
+    # GDK_SCALE is integer-only; GDK_DPI_SCALE and GDK_SCALE conflict — clear the other one
+    _CONFLICTING = {'gdk_scale': 'GDK_DPI_SCALE', 'gdk_dpi': 'GDK_SCALE'}
+    conflicting = _CONFLICTING.get(app.scale_via)
+
     try:
+        if conflicting:
+            subprocess.run(
+                ['flatpak', 'override', '--user',
+                 f'--unset-env={conflicting}', app.flatpak_id],
+                capture_output=True)
+
         if app.has_override:
+            val_str = str(max(1, round(app.scale))) if app.scale_via == 'gdk_scale' else fmt(app.scale)
             cmd = ['flatpak', 'override', '--user',
-                   f'--env={env_var}={fmt(app.scale)}', app.flatpak_id]
+                   f'--env={env_var}={val_str}', app.flatpak_id]
         else:
             cmd = ['flatpak', 'override', '--user',
                    f'--unset-env={env_var}', app.flatpak_id]
@@ -769,7 +800,11 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
                  C_DIM if not sel else C_SEL)
         elif app.has_override:
             _put(scr, row, col, "[ - ]", C_CTRL if sel else C_DIM)
-            val_s = f"  {fmt(app.scale)}  "
+            if app.scale_via == 'gdk_scale':
+                display_val = str(max(1, round(app.scale)))
+            else:
+                display_val = fmt(app.scale)
+            val_s = f"  {display_val}  "
             _put(scr, row, col + 5, val_s, curses.A_BOLD if sel else 0)
             _put(scr, row, col + 5 + len(val_s), "[ + ]",
                  C_CTRL if sel else C_DIM)
@@ -953,9 +988,16 @@ def _adjust(gs: GlobalSettings, visible: list, ui: UIState, direction: int):
         if idx < len(visible):
             app = visible[idx]
             if app.has_override:
-                nv = round((app.scale + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
-                app.scale = max(MIN_APP, min(MAX_APP, round(nv, 10)))
-                ui.status_msg = f"{app.name} → {fmt(app.scale)}"
+                if app.scale_via == 'gdk_scale':
+                    # Integer-only: snap to the next integer in the direction pressed
+                    cur_int = max(1, round(app.scale))
+                    new_int = max(1, min(int(MAX_APP), cur_int + direction))
+                    app.scale = float(new_int)
+                    ui.status_msg = f"{app.name} → GDK_SCALE={new_int}"
+                else:
+                    nv = round((app.scale + direction * SCALE_STEP) / SCALE_STEP) * SCALE_STEP
+                    app.scale = max(MIN_APP, min(MAX_APP, round(nv, 10)))
+                    ui.status_msg = f"{app.name} → {fmt(app.scale)}"
                 ui.status_kind = "info"
             else:
                 app.scale = ui.apply_all
@@ -1007,7 +1049,7 @@ def _toggle_override(visible: list, ui: UIState):
 
 
 def _toggle_method(visible: list, ui: UIState):
-    """Cycle scale_via for native (non-Electron) apps: gdk_dpi/qt ↔ app."""
+    """Cycle scale_via for native (non-Electron) apps."""
     idx = ui.cursor - GLOBAL_ROWS
     if idx < 0 or idx >= len(visible):
         return
@@ -1016,19 +1058,38 @@ def _toggle_method(visible: list, ui: UIState):
         ui.status_msg = f"{app.name}: Electron app — method is fixed (--force-device-scale-factor)"
         ui.status_kind = "warn"
         return
-    if app.scale_via == 'app':
-        # Switch back to env-var mode
-        native = 'qt' if app.flatpak_id and 'kde' in (
-            app.flatpak_id or '').lower() else 'gdk_dpi'
-        app.scale_via = native
-        ui.status_msg = (f"{app.name}: switched to {_SCALE_ENV[native]} env var mode "
-                         f"— [d] to enable, [s] to save")
+
+    is_qt = app.scale_via == 'qt' or (app.flatpak_id and 'kde' in (app.flatpak_id or '').lower())
+
+    if is_qt:
+        # Qt cycle: qt → app → qt
+        if app.scale_via == 'app':
+            app.scale_via = 'qt'
+            ui.status_msg = (f"{app.name}: switched to {_SCALE_ENV['qt']} env var mode "
+                             f"— [d] to enable, [s] to save")
+        else:
+            app.scale_via = 'app'
+            app.has_override = False
+            ui.status_msg = (f"{app.name}: marked as app-managed "
+                             f"— configure scale in the app's own Preferences — [s] to save")
     else:
-        # Switch to app-managed
-        app.scale_via = 'app'
-        app.has_override = False   # clear any pending env override
-        ui.status_msg = (f"{app.name}: marked as app-managed "
-                         f"— configure scale in the app's own Preferences — [s] to save")
+        # GNOME/GTK/wxWidgets cycle: gdk_dpi → gdk_scale → app → gdk_dpi
+        _cycle = ['gdk_dpi', 'gdk_scale', 'app']
+        cur = app.scale_via if app.scale_via in _cycle else 'gdk_dpi'
+        nxt = _cycle[(_cycle.index(cur) + 1) % len(_cycle)]
+        app.scale_via = nxt
+        if nxt == 'gdk_dpi':
+            ui.status_msg = (f"{app.name}: switched to GDK_DPI_SCALE (text/font DPI only) "
+                             f"— [s] to save")
+        elif nxt == 'gdk_scale':
+            # Snap internal scale to the nearest valid integer so ←→ starts correctly
+            app.scale = float(max(1, round(app.scale)))
+            ui.status_msg = (f"{app.name}: switched to GDK_SCALE={int(app.scale)} (scales full UI incl. icons) "
+                             f"— [s] to save")
+        else:
+            app.has_override = False
+            ui.status_msg = (f"{app.name}: marked as app-managed "
+                             f"— configure scale in the app's own Preferences — [s] to save")
     ui.status_kind = "info"
 
 
