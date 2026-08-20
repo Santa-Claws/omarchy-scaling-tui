@@ -10,6 +10,7 @@ Edits all relevant config files atomically in one save:
 |-----|---------------|
 | Global scale | `~/.config/hypr/monitors.lua` (or legacy `monitors.conf`) |
 | Electron apps | Desktop entry plus active Hyprland autostart/binding files when present |
+| Discord Flatpak | Discord's persistent `discord-flags.conf` wrapper config |
 | Native Flatpaks | Per-app `GDK_DPI_SCALE`, `GDK_SCALE`, or `QT_SCALE_FACTOR` override |
 
 ## Install

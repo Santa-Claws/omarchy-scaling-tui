@@ -132,6 +132,15 @@ DEFAULT_SCALE = 0.7
 GLOBAL_ROWS   = 3   # GDK_SCALE, Monitor Scale, Apply to All
 TUI_CONFIG    = Path.home() / '.config/omarchy-scaling-tui.json'
 
+# Some Electron Flatpaks expose a wrapper-owned flags file.  Writing it keeps
+# the scale override active even when the app is started outside its desktop
+# entry (for example, from a protocol handler or a terminal).
+NATIVE_FLAG_CONFIGS = {
+    'com.discordapp.Discord': (
+        HOME / '.var/app/com.discordapp.Discord/config/discord-flags.conf'
+    ),
+}
+
 
 # ── data model ───────────────────────────────────────────────────────────────
 
@@ -154,6 +163,7 @@ class AppEntry:
     scale_via: str = 'flag'       # 'flag' | 'gdk_dpi' | 'gdk_scale' | 'qt' | 'app'
     saved_scale_via: str = 'flag' # tracks persisted state for dirty detection
     wm_class: Optional[str] = None  # StartupWMClass from .desktop, for window matching
+    native_flag_path: Optional[Path] = None
 
     @property
     def desktop_unsynced(self) -> bool:
@@ -165,12 +175,35 @@ class AppEntry:
         return not any(o.path == self.desktop_path for o in self.occurrences)
 
     @property
+    def native_flags_unsynced(self) -> bool:
+        """True when a wrapper-owned Electron flags file lacks the override."""
+        if self.scale_via != 'flag' or not self.has_override or not self.native_flag_path:
+            return False
+        return not any(o.path == self.native_flag_path for o in self.occurrences)
+
+    @property
+    def occurrence_values_unsynced(self) -> bool:
+        """True when active launch paths disagree about an Electron scale."""
+        if self.scale_via != 'flag' or not self.has_override:
+            return False
+        expected = fmt(self.scale)
+        for occurrence in self.occurrences:
+            match = FLAG_RE.search(occurrence.line)
+            if match and fmt(float(match.group(2))) != expected:
+                return True
+        return False
+
+    @property
     def dirty(self):
         if self.scale_via != self.saved_scale_via:
             return True
         if self.has_override != self.saved_has_override:
             return True
         if self.desktop_unsynced:
+            return True
+        if self.native_flags_unsynced:
+            return True
+        if self.occurrence_values_unsynced:
             return True
         return self.has_override and abs(self.scale - self.saved_scale) > 1e-9
 
@@ -424,6 +457,27 @@ def discover_apps() -> list:
     except OSError:
         pass
 
+    # Step 4: wrapper-owned Electron flag files.  Discord's Flatpak reads this
+    # file on every launch, including launches that bypass the desktop entry.
+    for app in apps.values():
+        flag_path = NATIVE_FLAG_CONFIGS.get(app.flatpak_id)
+        if not flag_path:
+            continue
+        app.native_flag_path = flag_path
+        try:
+            for line in flag_path.read_text().splitlines():
+                match = FLAG_RE.search(line)
+                if not match:
+                    continue
+                app.occurrences.append(Occurrence(flag_path, line))
+                if not app.has_override:
+                    scale = float(match.group(2))
+                    app.scale = app.saved_scale = scale
+                    app.has_override = app.saved_has_override = True
+                break
+        except OSError:
+            pass
+
     # Apply persisted app-managed choices
     app_managed = _load_app_managed()
     for app in apps.values():
@@ -600,6 +654,29 @@ def _inject_desktop(app: AppEntry, new_val: str, errors: list) -> None:
         errors.append(f"{app.desktop_path.name}: {e}")
 
 
+def _inject_native_flags(app: AppEntry, new_val: str, errors: list) -> None:
+    """Add the scale switch to an app wrapper's persistent flags file."""
+    path = app.native_flag_path
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = path.read_text() if path.exists() else ''
+        if FLAG_RE.search(content):
+            new_content = FLAG_RE.sub(r'\g<1>' + new_val, content)
+        else:
+            prefix = '' if not content or content.endswith('\n') else '\n'
+            new_content = content + prefix + f'--force-device-scale-factor={new_val}\n'
+        atomic_write(path, new_content)
+        app.occurrences = [o for o in app.occurrences if o.path != path]
+        for line in new_content.splitlines():
+            if FLAG_RE.search(line):
+                app.occurrences.append(Occurrence(path, line))
+                break
+    except OSError as e:
+        errors.append(f"{path.name}: {e}")
+
+
 def save_app(app: AppEntry) -> Optional[str]:
     if app.scale_via in _SCALE_ENV or app.scale_via == 'app':
         return _save_flatpak_env(app)
@@ -627,12 +704,16 @@ def save_app(app: AppEntry) -> Optional[str]:
             occ_paths = {o.path for o in app.occurrences}
             if app.desktop_path and app.desktop_path not in occ_paths:
                 _inject_desktop(app, new_val, errors)
+            if (app.native_flag_path and
+                    app.native_flag_path not in occ_paths):
+                _inject_native_flags(app, new_val, errors)
         else:
             # Add flag to .desktop Exec line, copying to user dir if needed
             if app.desktop_path:
                 _inject_desktop(app, new_val, errors)
             else:
                 errors.append(f"{app.name}: no .desktop file to write override to")
+            _inject_native_flags(app, new_val, errors)
     else:
         # Remove flag from all occurrence files
         by_file = defaultdict(list)
