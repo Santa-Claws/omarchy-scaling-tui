@@ -10,7 +10,7 @@ Edits all relevant config files atomically in one save:
 |-----|---------------|
 | Global scale | `~/.config/hypr/monitors.lua` (or legacy `monitors.conf`) |
 | Electron apps | Desktop entry plus active Hyprland autostart/binding files when present |
-| Discord Flatpak | Discord's persistent `discord-flags.conf` wrapper config |
+| Discord Flatpak | Persistent wrapper config plus effective live Discord UI zoom |
 | Native Flatpaks | Per-app `GDK_DPI_SCALE`, `GDK_SCALE`, or `QT_SCALE_FACTOR` override |
 
 ## Install
@@ -45,6 +45,8 @@ python3 scaling_tui.py
 | `q` | Quit (confirm if unsaved) |
 
 Scale range: 0.1 – 3.0. Changes take effect on next app launch (or autostart on next login).
+For a running Discord Flatpak, saving also applies its UI zoom immediately;
+Chromium otherwise clamps command-line device scaling below 1.0.
 
 ## Requirements
 

@@ -5,7 +5,9 @@ import curses
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -677,6 +679,49 @@ def _inject_native_flags(app: AppEntry, new_val: str, errors: list) -> None:
         errors.append(f"{path.name}: {e}")
 
 
+def _apply_live_discord_zoom(scale: float) -> tuple[bool, Optional[str]]:
+    """Apply effective sub-1 scaling through Discord's own zoom shortcuts.
+
+    Chromium clamps device scale factors to at least 1.0.  Discord exposes its
+    renderer zoom through Ctrl+0 and Ctrl+Plus/Minus, so use targeted Hyprland
+    shortcuts without moving keyboard focus away from the user.
+    """
+    try:
+        clients = subprocess.run(
+            ['hyprctl', 'clients', '-j'], capture_output=True, text=True,
+            timeout=5
+        )
+        if clients.returncode != 0 or 'com.discordapp.Discord' not in clients.stdout:
+            return False, None
+
+        target = max(0.5, min(2.0, scale))
+        steps = round(abs(target - 1.0) * 10)
+        reset = ('hl.dsp.send_shortcut({ mods = "CTRL", key = "code:19", '
+                 'window = "class:com.discordapp.Discord" })')
+        commands = [reset]
+        if steps:
+            key = 'minus' if target < 1.0 else 'equal'
+            commands.extend(
+                'hl.dsp.send_shortcut({ mods = "CTRL", key = "' + key + '", '
+                'window = "class:com.discordapp.Discord" })'
+                for _ in range(steps)
+            )
+
+        for command in commands:
+            result = subprocess.run(
+                ['hyprctl', 'dispatch', command], capture_output=True,
+                text=True, timeout=5
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                return False, f"Discord live zoom failed — {detail}"
+        return True, None
+    except FileNotFoundError:
+        return False, None
+    except Exception as e:
+        return False, f"Discord live zoom failed — {e}"
+
+
 def save_app(app: AppEntry) -> Optional[str]:
     if app.scale_via in _SCALE_ENV or app.scale_via == 'app':
         return _save_flatpak_env(app)
@@ -739,6 +784,7 @@ def save_app(app: AppEntry) -> Optional[str]:
 def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
     errors = []
     saved = 0
+    discord_zoom_applied = False
 
     e = save_global(gs)
     if e:
@@ -751,6 +797,19 @@ def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
                 errors.append(f"{app.name}: {e}")
             else:
                 saved += 1
+
+    # Reapply Discord on every save, even when its files were already synced.
+    # This makes [s] visibly effective after Discord has been restarted.
+    for app in apps:
+        if app.flatpak_id != 'com.discordapp.Discord':
+            continue
+        applied, error = _apply_live_discord_zoom(
+            app.scale if app.has_override else 1.0
+        )
+        discord_zoom_applied = applied
+        if error:
+            errors.append(error)
+        break
 
     # Persist app-managed choices to config
     managed_ids = {a.flatpak_id for a in apps
@@ -772,6 +831,8 @@ def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
         ui.status_msg = (f"Saved. GDK_SCALE={int(gs.gdk_scale)}  "
                          f"{n_ovr} override{'s' if n_ovr != 1 else ''}  "
                          f"{len(apps)} apps")
+        if discord_zoom_applied:
+            ui.status_msg += "  Discord zoom applied live"
         ui.status_kind = "ok"
 
 
@@ -1245,4 +1306,19 @@ def main(scr) -> None:
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--apply-discord-zoom':
+        try:
+            requested_scale = float(sys.argv[2])
+        except ValueError:
+            print(f"Invalid Discord scale: {sys.argv[2]}", file=sys.stderr)
+            raise SystemExit(2)
+        for _ in range(30):
+            applied, error = _apply_live_discord_zoom(requested_scale)
+            if error:
+                print(error, file=sys.stderr)
+                raise SystemExit(1)
+            if applied:
+                raise SystemExit(0)
+            time.sleep(1)
+        raise SystemExit(3)
     curses.wrapper(main)
