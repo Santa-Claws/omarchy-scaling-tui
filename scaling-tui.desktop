@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Scaling TUI
+Comment=Adjust global and per-app display scaling
+Exec=omarchy-scaling-tui
+Terminal=true
+Type=Application
+Icon=preferences-desktop-display
+Categories=Utility;System;
+Keywords=scaling;tui;resize;display;

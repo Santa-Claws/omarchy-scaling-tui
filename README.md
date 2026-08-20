@@ -1,13 +1,16 @@
 # omarchy-scaling-tui
 
-A terminal UI for adjusting `--force-device-scale-factor` for Discord and Spotify in an [Omarchy](https://omarchy.org) / Hyprland setup.
+A terminal UI for global and per-app HiDPI scaling on an [Omarchy](https://omarchy.org) / Hyprland desktop.
+
+Supports Omarchy Quattro's active Lua configuration and automatically falls back to legacy `.conf` files on older installs.
 
 Edits all relevant config files atomically in one save:
 
-| App | Files modified |
+| Setting | Files modified |
 |-----|---------------|
-| Discord | `~/.config/hypr/autostart.conf`, `~/.local/share/applications/com.discordapp.Discord.desktop` |
-| Spotify | `~/.config/hypr/autostart.conf`, `~/.config/hypr/bindings.conf`, `~/.local/share/applications/spotify.desktop` |
+| Global scale | `~/.config/hypr/monitors.lua` (or legacy `monitors.conf`) |
+| Electron apps | Desktop entry plus active Hyprland autostart/binding files when present |
+| Native Flatpaks | Per-app `GDK_DPI_SCALE`, `GDK_SCALE`, or `QT_SCALE_FACTOR` override |
 
 ## Install
 
@@ -15,7 +18,7 @@ Edits all relevant config files atomically in one save:
 bash install.sh
 ```
 
-This symlinks `scaling_tui.py` into `~/.local/bin/omarchy-scaling-tui`.
+This symlinks `scaling_tui.py` into `~/.local/bin/omarchy-scaling-tui` and installs a portable application-menu entry.
 
 ## Run
 
@@ -29,10 +32,14 @@ python3 scaling_tui.py
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` / `Tab` | Switch between Discord / Spotify |
+| `↑` / `↓` / `Tab` | Move through global and per-app settings |
 | `←` / `-` | Decrease scale by 0.05 |
 | `→` / `+` / `=` | Increase scale by 0.05 |
-| `s` | Save all files |
+| `d` | Enable or disable the selected app override |
+| `m` | Change the scaling method for native Flatpaks |
+| `a` | Apply the selected value to active overrides |
+| `/` | Search applications |
+| `s` | Save all changes |
 | `r` | Reload from disk |
 | `q` | Quit (confirm if unsaved) |
 

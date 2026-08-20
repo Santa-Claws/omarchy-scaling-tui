@@ -12,9 +12,19 @@ from pathlib import Path
 from typing import Optional
 
 HOME      = Path.home()
-MONITORS  = HOME / ".config/hypr/monitors.conf"
-AUTOSTART = HOME / ".config/hypr/autostart.conf"
-BINDINGS  = HOME / ".config/hypr/bindings.conf"
+HYPR_DIR  = HOME / ".config/hypr"
+
+
+def _active_hypr_config(stem: str) -> Path:
+    """Prefer Quattro's Lua config, with legacy .conf fallback."""
+    lua_path = HYPR_DIR / f"{stem}.lua"
+    conf_path = HYPR_DIR / f"{stem}.conf"
+    return lua_path if lua_path.exists() else conf_path
+
+
+MONITORS  = _active_hypr_config("monitors")
+AUTOSTART = _active_hypr_config("autostart")
+BINDINGS  = _active_hypr_config("bindings")
 USER_APPS = HOME / ".local/share/applications"
 
 
@@ -94,8 +104,17 @@ def _save_app_managed(ids: set) -> None:
 
 
 FLAG_RE       = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
-GDK_RE        = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
-MONITOR_RE    = re.compile(r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE)
+GDK_CONF_RE = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
+MONITOR_CONF_RE = re.compile(
+    r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE
+)
+GDK_LUA_RE = re.compile(
+    r'^(local\s+omarchy_gdk_scale\s*=\s*)([\d.]+)', re.MULTILINE
+)
+MONITOR_LUA_RE = re.compile(
+    r'^(local\s+omarchy_monitor_scale\s*=\s*)(?:"(auto)"|(\d[\d.]*))',
+    re.MULTILINE,
+)
 WEBAPP_RE     = re.compile(r'^omarchy-(?:launch-webapp|webapp-handler)')
 EXEC_RE       = re.compile(r'^(Exec=)(.+)$', re.MULTILINE)
 FLATPAK_ID_RE = re.compile(r'flatpak\s+run\s+(?:--\S+\s+)*([\w-]+(?:\.[\w-]+)+)')
@@ -365,7 +384,7 @@ def discover_apps() -> list:
                                  scale_via='flag', saved_scale_via='flag',
                                  wm_class=wm_class)
 
-    # Step 2: autostart.conf — merge occurrences (flag-based apps only)
+    # Step 2: active autostart config — merge occurrences (flag-based apps only)
     try:
         for line in AUTOSTART.read_text().splitlines():
             if not FLAG_RE.search(line):
@@ -391,7 +410,7 @@ def discover_apps() -> list:
     except OSError:
         pass
 
-    # Step 3: bindings.conf — merge occurrences (flag-based apps only)
+    # Step 3: active bindings config — merge occurrences (flag-based apps only)
     try:
         for line in BINDINGS.read_text().splitlines():
             if not FLAG_RE.search(line):
@@ -427,17 +446,23 @@ def load_global() -> GlobalSettings:
     except OSError as e:
         return GlobalSettings(2.0, 'auto', 2.0, 'auto', load_error=str(e))
 
+    gdk_re = GDK_LUA_RE if MONITORS.suffix == '.lua' else GDK_CONF_RE
+    monitor_re = MONITOR_LUA_RE if MONITORS.suffix == '.lua' else MONITOR_CONF_RE
+
     gdk = 2.0
-    m = GDK_RE.search(text)
+    m = gdk_re.search(text)
     if m:
         gdk = float(m.group(2))
 
     mon = 'auto'
-    m = MONITOR_RE.search(text)
+    m = monitor_re.search(text)
     if m:
-        mon = m.group(2)
+        if MONITORS.suffix == '.lua':
+            mon = m.group(2) or m.group(3)
+        else:
+            mon = m.group(2)
 
-    err = None if GDK_RE.search(text) else "GDK_SCALE line not found in monitors.conf"
+    err = None if gdk_re.search(text) else f"GDK_SCALE line not found in {MONITORS.name}"
     return GlobalSettings(gdk, mon, gdk, mon, load_error=err)
 
 
@@ -506,10 +531,20 @@ def save_global(gs: GlobalSettings) -> Optional[str]:
         return str(e)
 
     gdk_str = f'{gs.gdk_scale:.10f}'.rstrip('0').rstrip('.')
-    if GDK_RE.search(text):
-        text = GDK_RE.sub(r'\g<1>' + gdk_str, text)
+    if MONITORS.suffix == '.lua':
+        if GDK_LUA_RE.search(text):
+            text = GDK_LUA_RE.sub(r'\g<1>' + gdk_str, text)
 
-    text = MONITOR_RE.sub(r'\g<1>' + gs.monitor_scale, text)
+        monitor_value = (f'"{gs.monitor_scale}"'
+                         if gs.monitor_scale == 'auto'
+                         else gs.monitor_scale)
+        text = MONITOR_LUA_RE.sub(
+            lambda match: match.group(1) + monitor_value, text
+        )
+    else:
+        if GDK_CONF_RE.search(text):
+            text = GDK_CONF_RE.sub(r'\g<1>' + gdk_str, text)
+        text = MONITOR_CONF_RE.sub(r'\g<1>' + gs.monitor_scale, text)
 
     try:
         atomic_write(MONITORS, text)
@@ -626,7 +661,7 @@ def save_all(gs: GlobalSettings, apps: list, ui: UIState) -> None:
 
     e = save_global(gs)
     if e:
-        errors.append(f"monitors.conf: {e}")
+        errors.append(f"{MONITORS.name}: {e}")
 
     for app in apps:
         if app.dirty:
@@ -715,7 +750,7 @@ def draw(scr, gs: GlobalSettings, apps: list, ui: UIState) -> None:
 
     # ── Global section ──────────────────────────────────────────────────────
     _put(scr, row, 2, "Global", curses.A_BOLD)
-    _put(scr, row, 9, " (monitors.conf)", C_DIM)
+    _put(scr, row, 9, f" ({MONITORS.name})", C_DIM)
     row += 1
     _put(scr, row, 2, "─" * min(w - 4, 56), C_DIM)
     row += 1
