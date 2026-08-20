@@ -100,7 +100,7 @@ def _load_app_managed() -> set:
 def _save_app_managed(ids: set) -> None:
     import json
     TUI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    TUI_CONFIG.write_text(json.dumps({'app_managed': sorted(ids)}, indent=2))
+    TUI_CONFIG.write_text(json.dumps({'app_managed': sorted(ids)}, indent=2) + '\n')
 
 
 FLAG_RE       = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
