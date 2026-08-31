@@ -143,6 +143,13 @@ NATIVE_FLAG_CONFIGS = {
     ),
 }
 
+# Native Chromium's Arch launcher reads this file for every invocation.  Keep
+# it in sync with the desktop entry so Omarchy webapps, terminal launches, and
+# other callers that execute /usr/bin/chromium directly retain the override.
+NATIVE_DESKTOP_FLAG_CONFIGS = {
+    'chromium.desktop': HOME / '.config/chromium-flags.conf',
+}
+
 
 # ── data model ───────────────────────────────────────────────────────────────
 
@@ -459,10 +466,12 @@ def discover_apps() -> list:
     except OSError:
         pass
 
-    # Step 4: wrapper-owned Electron flag files.  Discord's Flatpak reads this
-    # file on every launch, including launches that bypass the desktop entry.
+    # Step 4: wrapper-owned Electron/Chromium flag files.  These are read on
+    # every launch, including invocations that bypass the desktop entry.
     for app in apps.values():
         flag_path = NATIVE_FLAG_CONFIGS.get(app.flatpak_id)
+        if not flag_path and app.desktop_path:
+            flag_path = NATIVE_DESKTOP_FLAG_CONFIGS.get(app.desktop_path.name)
         if not flag_path:
             continue
         app.native_flag_path = flag_path
