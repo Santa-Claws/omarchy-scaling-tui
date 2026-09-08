@@ -106,6 +106,8 @@ def _save_app_managed(ids: set) -> None:
 
 
 FLAG_RE       = re.compile(r'(--force-device-scale-factor=)([\d.]+)')
+OZONE_PLATFORM_RE = re.compile(r'^--ozone-platform=(\S+)$', re.MULTILINE)
+OZONE_HINT_RE = re.compile(r'^--ozone-platform-hint=\S+\n?', re.MULTILINE)
 GDK_CONF_RE = re.compile(r'^(env = GDK_SCALE,)([\d.]+)', re.MULTILINE)
 MONITOR_CONF_RE = re.compile(
     r'^(monitor\s*=\s*[^,]*,[^,]*,[^,]*,)(\d[\d.]*|auto)', re.MULTILINE
@@ -149,6 +151,7 @@ NATIVE_FLAG_CONFIGS = {
 NATIVE_DESKTOP_FLAG_CONFIGS = {
     'chromium.desktop': HOME / '.config/chromium-flags.conf',
 }
+CHROMIUM_X11_MARKER = '# omarchy-scaling-tui: XWayland fractional scaling'
 
 
 # ── data model ───────────────────────────────────────────────────────────────
@@ -173,6 +176,7 @@ class AppEntry:
     saved_scale_via: str = 'flag' # tracks persisted state for dirty detection
     wm_class: Optional[str] = None  # StartupWMClass from .desktop, for window matching
     native_flag_path: Optional[Path] = None
+    native_platform_synced: bool = True
 
     @property
     def desktop_unsynced(self) -> bool:
@@ -213,6 +217,8 @@ class AppEntry:
         if self.native_flags_unsynced:
             return True
         if self.occurrence_values_unsynced:
+            return True
+        if self.has_override and not self.native_platform_synced:
             return True
         return self.has_override and abs(self.scale - self.saved_scale) > 1e-9
 
@@ -476,7 +482,8 @@ def discover_apps() -> list:
             continue
         app.native_flag_path = flag_path
         try:
-            for line in flag_path.read_text().splitlines():
+            flag_content = flag_path.read_text()
+            for line in flag_content.splitlines():
                 match = FLAG_RE.search(line)
                 if not match:
                     continue
@@ -486,6 +493,12 @@ def discover_apps() -> list:
                     app.scale = app.saved_scale = scale
                     app.has_override = app.saved_has_override = True
                 break
+            if (app.desktop_path and
+                    app.desktop_path.name == 'chromium.desktop' and
+                    app.has_override):
+                app.native_platform_synced = bool(
+                    re.search(r'^--ozone-platform=x11$', flag_content, re.MULTILINE)
+                ) and not OZONE_HINT_RE.search(flag_content)
         except OSError:
             pass
 
@@ -688,6 +701,53 @@ def _inject_native_flags(app: AppEntry, new_val: str, errors: list) -> None:
         errors.append(f"{path.name}: {e}")
 
 
+def _sync_chromium_platform(app: AppEntry, enabled: bool, errors: list) -> None:
+    """Use XWayland while Chromium fractional scaling is enabled.
+
+    Chromium treats ``--force-device-scale-factor`` as a test-only display
+    scale on native Wayland, so values below 1 do not shrink its visible UI.
+    With Hyprland's ``xwayland:force_zero_scaling`` setting, the same flag is
+    effective under XWayland.  A marker lets us safely restore Wayland when
+    the TUI override is later disabled.
+    """
+    if (not app.native_flag_path or not app.desktop_path or
+            app.desktop_path.name != 'chromium.desktop'):
+        return
+
+    path = app.native_flag_path
+    try:
+        content = path.read_text() if path.exists() else ''
+        was_managed = CHROMIUM_X11_MARKER in content
+        content = content.replace(CHROMIUM_X11_MARKER + '\n', '')
+        content = content.replace(CHROMIUM_X11_MARKER, '')
+
+        if enabled:
+            if OZONE_PLATFORM_RE.search(content):
+                content = OZONE_PLATFORM_RE.sub('--ozone-platform=x11', content)
+            else:
+                content = '--ozone-platform=x11\n' + content
+            content = OZONE_HINT_RE.sub('', content)
+            content = CHROMIUM_X11_MARKER + '\n' + content.lstrip('\n')
+            app.native_platform_synced = True
+        elif was_managed:
+            if OZONE_PLATFORM_RE.search(content):
+                content = OZONE_PLATFORM_RE.sub('--ozone-platform=wayland', content)
+            else:
+                content = '--ozone-platform=wayland\n' + content
+            if not OZONE_HINT_RE.search(content):
+                platform_line = '--ozone-platform=wayland\n'
+                content = content.replace(
+                    platform_line,
+                    platform_line + '--ozone-platform-hint=wayland\n',
+                    1,
+                )
+            app.native_platform_synced = True
+
+        atomic_write(path, content)
+    except OSError as e:
+        errors.append(f"{path.name}: {e}")
+
+
 def _apply_live_discord_zoom(scale: float) -> tuple[bool, Optional[str]]:
     """Apply effective sub-1 scaling through Discord's own zoom shortcuts.
 
@@ -783,6 +843,8 @@ def save_app(app: AppEntry) -> Optional[str]:
             except OSError as e:
                 errors.append(f"{path.name}: {e}")
         app.occurrences.clear()
+
+    _sync_chromium_platform(app, app.has_override, errors)
 
     if not errors:
         app.saved_scale = app.scale
